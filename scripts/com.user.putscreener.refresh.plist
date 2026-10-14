@@ -1,0 +1,50 @@
+<?xml version="1.0" encoding="UTF-8"?>
+<!DOCTYPE plist PUBLIC "-//Apple//DTD PLIST 1.0//EN" "http://www.apple.com/DTDs/PropertyList-1.0.dtd">
+<!--
+macOS launchd job: runs run_pipeline.py once every weekday morning shortly
+after the US market opens (9:35am LOCAL TIME on the machine running this -
+adjust StartCalendarInterval if your Mac isn't on US Eastern time).
+
+Install:
+  1. Edit the two /REPLACE/ME paths below to your actual project + python paths.
+     Find your python path with: `which python3` (or your venv's python).
+  2. cp this file to ~/Library/LaunchAgents/com.user.putscreener.refresh.plist
+  3. launchctl load ~/Library/LaunchAgents/com.user.putscreener.refresh.plist
+
+Logs land in logs/launchd.out.log and logs/launchd.err.log inside the project.
+
+Uninstall:
+  launchctl unload ~/Library/LaunchAgents/com.user.putscreener.refresh.plist
+-->
+<plist version="1.0">
+<dict>
+    <key>Label</key>
+    <string>com.user.putscreener.refresh</string>
+
+    <key>ProgramArguments</key>
+    <array>
+        <string>/REPLACE/ME/path/to/python3</string>
+        <string>/REPLACE/ME/path/to/stock-put-screener/run_pipeline.py</string>
+    </array>
+
+    <key>WorkingDirectory</key>
+    <string>/REPLACE/ME/path/to/stock-put-screener</string>
+
+    <key>StartCalendarInterval</key>
+    <array>
+        <dict><key>Weekday</key><integer>1</integer><key>Hour</key><integer>9</integer><key>Minute</key><integer>35</integer></dict>
+        <dict><key>Weekday</key><integer>2</integer><key>Hour</key><integer>9</integer><key>Minute</key><integer>35</integer></dict>
+        <dict><key>Weekday</key><integer>3</integer><key>Hour</key><integer>9</integer><key>Minute</key><integer>35</integer></dict>
+        <dict><key>Weekday</key><integer>4</integer><key>Hour</key><integer>9</integer><key>Minute</key><integer>35</integer></dict>
+        <dict><key>Weekday</key><integer>5</integer><key>Hour</key><integer>9</integer><key>Minute</key><integer>35</integer></dict>
+    </array>
+
+    <key>StandardOutPath</key>
+    <string>/REPLACE/ME/path/to/stock-put-screener/logs/launchd.out.log</string>
+    <key>StandardErrorPath</key>
+    <string>/REPLACE/ME/path/to/stock-put-screener/logs/launchd.err.log</string>
+
+    <key>RunAtLoad</key>
+    <false/>
+</dict>
+</plist>

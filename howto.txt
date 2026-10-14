@@ -1,0 +1,4 @@
+python3 -m venv .venv && source .venv/bin/activate
+pip install -r requirements.txt
+
+Edit config.yaml and put your real email in sec_user_agent (SEC blocks placeholder user agents), then smoke-test with python run_pipeline.py --tickers AAPL,MSFT,QQQ -v before a full run, and start the dashboard with uvicorn app:app --reload --port 8787.

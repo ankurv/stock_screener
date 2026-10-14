@@ -1,0 +1,317 @@
+# ---------------------------------------------------------------------------
+# Cash-Secured Put Screener - configuration
+# Edit this file to change behavior without touching code.
+# ---------------------------------------------------------------------------
+
+# --- Universe --------------------------------------------------------------
+# "sp500"  -> auto-pulled list of S&P 500 tickers (cached locally, refreshed monthly)
+# "custom" -> use the explicit `custom_tickers` list below instead
+universe_mode: "sp500"
+custom_tickers:
+  - AAPL
+  - MSFT
+  - NVDA
+  - AMD
+  - GOOGL
+
+# Popular index/sector ETFs to always include alongside the universe above
+# (these have no earnings date, no 8-K/13F issuer match in general, and no
+# analyst recommendation - those fields just come back empty/neutral for them).
+include_etfs:
+  - QQQ
+  - SPY
+  - IWM
+  - DIA
+  # The 11 SPDR Select Sector ETFs - same tickers used for the dashboard's
+  # sector-performance panel (see sector_performance below), also screened
+  # as their own cash-secured put candidates here.
+  - XLK
+  - XLF
+  - XLV
+  - XLY
+  - XLC
+  - XLI
+  - XLP
+  - XLE
+  - XLU
+  - XLRE
+  - XLB
+
+# Pre-filter applied to the universe above (not to include_etfs, which are
+# opted in explicitly) before a pipeline run even looks at options chains/SEC
+# filings/news for a name - this is what keeps a run from taking forever by
+# scanning every S&P 500 constituent every time. Built in the background on
+# server startup and refreshed on cache_ttl_minutes.universe_filter (default
+# weekly), so normal runs just reuse the cached pass/fail per ticker - no
+# extra network cost most of the time. Market cap + average share volume
+# come from one cheap fast_info call per ticker (not a full options-chain
+# pull), used as a proxy for "this name's options are liquid enough to
+# actually trade" since checking real options liquidity for the whole
+# universe would defeat the point. Bypassed entirely when you pass
+# --tickers to run_pipeline.py.
+universe_filter:
+  min_market_cap: 20000000000   # $20B - large caps only
+  min_avg_volume: 1000000       # avg daily share volume
+  max_workers: 8                 # concurrent fetches when building/rebuilding - higher = faster but more
+                                  # load on Yahoo's endpoints at once; lower if you start seeing fetch failures
+
+# --- Strategies --------------------------------------------------------------
+# The pipeline is a shared data layer (universe, prices, option chains,
+# technicals, earnings, analyst snapshots, 8-Ks, 13Fs, news, sector
+# performance) feeding one or more independent *strategies*, each a module
+# under engine/strategies/ (see engine/strategies/__init__.py -> STRATEGIES).
+# Every enabled strategy here gets its own scan over the same cached data and
+# its own candidate table/dashboard section - add a new strategy by dropping
+# a module in engine/strategies/ and a key below, no changes to the shared
+# refresh steps in run_pipeline.py needed.
+strategies_enabled:
+  - cash_secured_put
+  - dip_buy
+  - three_day_rule
+
+# Once you accept or ignore a candidate, it won't be re-surfaced by a later
+# "Generate" for this many days, even if it would otherwise still qualify -
+# you already made a call on it, no need to see it again right away.
+decision_cooldown_days: 7
+
+strategies:
+  # --- Cash-secured puts -----------------------------------------------------
+  cash_secured_put:
+    max_candidates: 10                      # ranked watchlist, not a sized portfolio - no capital allocation here,
+                                             # just the top N by composite_score (within 5-10 is the usual range once
+                                             # the hard filters below have done their work); size each position yourself
+    min_composite_score: 0.35                # soft quality floor on top of the hard filters below - a candidate that
+                                              # only barely clears them still isn't necessarily worth surfacing. This
+                                              # is a ceiling-independent cutoff: a run can legitimately return fewer
+                                              # than max_candidates, including zero, if nothing clears this bar - that's
+                                              # the system saying "nothing good right now", not a bug.
+    max_per_sector: 2                        # at most this many picks from the same sector - without this, "top N by
+                                              # score" can hand back N names that are all one hot sector, which isn't
+                                              # really diversified (they'll tend to move together). Backfilled with
+                                              # same-sector picks only if there genuinely aren't enough other sectors
+                                              # to fill max_candidates (see engine.scorer.diversify_by_sector).
+    risk_profile: "aggressive"               # conservative|balanced|aggressive - caps which candidates are eligible by
+                                            # their 1-10 risk_score (dominated by implied vol): conservative <= 3,
+                                            # balanced <= 6, aggressive <= 10 (no extra filter). Also editable from the
+                                            # dashboard's Settings panel.
+    min_annualized_yield_pct: 8.0          # filter out puts yielding less than this annualized
+    min_bid_price: 0.50                    # hard filter: bids below this are dropped - brokerage commissions eat most/all of a premium that cheap
+    min_open_interest: 50                  # liquidity floor
+    max_bid_ask_spread_pct: 20.0           # (ask-bid)/mid, as % - hard filter: anything wider is dropped entirely
+    target_prob_otm_min: 0.60              # candidates below this probability-OTM are deprioritized
+    exclude_if_earnings_before_expiry: false  # true = hard filter out; false = just flag + score penalty
+    strike_otm_pct_max: 5.0                 # hard filter: strike must be within this % below current price (0% = ATM)
+    strike_otm_pct_max_with_earnings: 15.0  # wider band when earnings falls before expiry - worth the extra distance for the event risk
+    # Ranking weights (composite score; positive weights should sum to ~1.0,
+    # earnings_penalty is subtracted on top, it's not part of that sum)
+    weights:
+      annualized_yield: 0.40
+      probability_otm: 0.23
+      liquidity: 0.15
+      analyst_sentiment: 0.17
+      earnings_penalty: 0.10
+      anomaly_penalty: 0.05   # extra penalty if the last earnings reaction was a "beat but stock sold off anyway" anomaly
+
+  # --- Dip buy watch ----------------------------------------------------------
+  # "Overnight sweep": flags stocks that just saw a sharp correction but still
+  # look buyable rather than a falling knife - combines a drawdown filter, an
+  # oversold RSI confirmation, analyst support (not getting correctly
+  # re-rated down), no adverse legal news or "beat but sold off anyway"
+  # earnings anomaly behind the drop, and a sector-weakness/earnings-timing
+  # risk read. Not a sized portfolio like cash_secured_put - just a ranked
+  # watchlist, so no total_capital/positions here, just how many names to surface.
+  dip_buy:
+    drawdown_lookback_days: 10        # trading days the drawdown % is measured over
+    drawdown_threshold_pct: -8.0      # hard filter: must have dropped at least this much over the lookback
+    rsi_oversold_max: 32              # hard filter: RSI(14) must be at/below this (confirms "oversold", not just drifting down)
+    min_analyst_score: 0.5            # hard filter: engine.signals.analyst_sentiment_score (0-1) must be at/above this -
+                                       # screens out names correctly being re-rated down for a real fundamental problem
+    legal_news_lookback_days: 10      # exclude if a 'legal' category news item (see legal_keywords) landed within this many days
+    exclude_beat_but_sold_off: true   # hard filter: exclude if the last earnings reaction was a "beat but stock sold off
+                                       # anyway" anomaly - a sign something's wrong beneath the headline number, same
+                                       # signal cash_secured_put uses as a score penalty, but a harder red flag here
+                                       # since this strategy is specifically trying to avoid a falling knife
+    earnings_alert_days: 15           # always flagged on the card (not excluded) if earnings falls within this many
+                                       # days of being flagged - a real gap-risk event that can blow through the
+                                       # evaluation_horizon_days thesis regardless of how oversold/supported it looks
+    evaluation_horizon_days: 10       # days after being flagged before an outcome (rebounded/flat/further_decline) is scored
+    flat_band_pct: 2.0                # price move within +/- this % of the entry price counts as 'flat', not rebounded/declined
+    max_candidates: 10                # how many names to surface per run, ranked by composite_score
+    min_composite_score: 0.35          # soft quality floor beyond the hard filters above - fine (expected) for a run
+                                        # to return fewer than max_candidates, including zero, if nothing clears this
+    max_per_sector: 2                  # at most this many picks from the same sector - see strategies.cash_secured_put's
+                                        # identical setting / engine.scorer.diversify_by_sector for the full rationale
+    weights:
+      drawdown: 0.4
+      oversold: 0.3
+      analyst_sentiment: 0.3
+    # Risk-score blend (sums to 1.0) - technical dominates, with market mood,
+    # sector weakness (is the whole sector also correcting, not just this
+    # name?), and the earnings-timing alert each a secondary factor.
+    risk_weights:
+      technical: 0.4
+      market_mood: 0.2
+      sector: 0.2
+      earnings: 0.2
+
+  # --- 3-Day Rule --------------------------------------------------------------
+  # A stock often keeps correcting for ~3 trading days right after it reports
+  # earnings before stabilizing - the day that window ends is often a buyable
+  # overreaction rather than the start of a real decline. Combines a
+  # post-earnings correction-window drawdown filter, an EPS-surprise floor
+  # (screens out a genuine large miss - different from dip_buy's "beat but
+  # sold off" exclusion, since a beat/in-line that still sold off *is* the
+  # target setup here), and the same oversold/analyst-support/no-legal-news/
+  # sector-weakness/earnings-timing gates dip_buy uses so this isn't a
+  # falling knife either. Not a sized portfolio - just a ranked watchlist.
+  three_day_rule:
+    min_days_since_earnings: 4        # hard filter: today must be at least this many days past the last report -
+                                       # "day 4" is the idea, but trading-day precision isn't worth the complexity here
+    max_days_since_earnings: 8        # hard filter: and at most this many - past this the setup is stale, not fresh
+    drawdown_threshold_pct: -6.0      # hard filter: cumulative % change over the 3-day correction window must be at least this
+    min_earnings_surprise_pct: -5.0   # hard filter: exclude if the EPS surprise was a real miss worse than this - a
+                                       # genuine large miss is more likely a falling knife than an overreaction worth buying
+    rsi_oversold_max: 35              # hard filter: RSI(14) must be at/below this (confirms "oversold", not just drifting down)
+    min_analyst_score: 0.5            # hard filter: engine.signals.analyst_sentiment_score (0-1) must be at/above this
+    legal_news_lookback_days: 10      # exclude if a 'legal' category news item (see legal_keywords) landed within this many days
+    earnings_alert_days: 15           # always flagged on the card (not excluded) if the NEXT earnings falls within this
+                                       # many days of being flagged - real gap risk the other signals can't see
+    evaluation_horizon_days: 10       # days after being flagged before an outcome (rebounded/flat/further_decline) is scored
+    flat_band_pct: 2.0                # price move within +/- this % of the entry price counts as 'flat', not rebounded/declined
+    max_candidates: 10                # how many names to surface per run, ranked by composite_score
+    min_composite_score: 0.35          # soft quality floor beyond the hard filters above - fine (expected) for a run
+                                        # to return fewer than max_candidates, including zero, if nothing clears this
+    max_per_sector: 2                  # at most this many picks from the same sector - see strategies.cash_secured_put's
+                                        # identical setting / engine.scorer.diversify_by_sector for the full rationale
+    weights:
+      drawdown: 0.35
+      down_days: 0.15
+      oversold: 0.2
+      analyst_sentiment: 0.3
+    # Risk-score blend (sums to 1.0) - technical and the earnings-timing
+    # alert carry equal top weight here, with market mood and sector
+    # weakness as secondary factors.
+    risk_weights:
+      technical: 0.3
+      market_mood: 0.2
+      sector: 0.2
+      earnings: 0.3
+
+risk_free_rate: 0.045                  # used for Black-Scholes probability-OTM estimate (CSP-only consumer, kept global as a market constant)
+post_earnings_anomaly_threshold_pct: 3.0  # price move needed, against the EPS-surprise direction, to flag an anomaly (shared data-refresh step)
+
+
+# --- Prominent investors tracked for 13F signal (CIK = SEC's EDGAR company id)
+prominent_investors:
+  - name: "Berkshire Hathaway (Buffett)"
+    cik: "0001067983"
+  - name: "Scion Asset Management (Burry)"
+    cik: "0001649339"
+  - name: "Pershing Square (Ackman)"
+    cik: "0001336528"
+  - name: "Bridgewater Associates"
+    cik: "0001350694"
+  - name: "Third Point (Loeb)"
+    cik: "0001040273"
+  - name: "Appaloosa Management (Tepper)"
+    cik: "0001656456"
+  - name: "Tiger Global Management"
+    cik: "0001167483"
+  - name: "Duquesne Family Office (Druckenmiller)"
+    cik: "0001536411"
+  - name: "Soros Fund Management"
+    cik: "0001029160"
+  - name: "Citadel Advisors"
+    cik: "0001423053"
+
+# --- News / RSS -------------------------------------------------------------
+# Categories are checked in this order: legal > ma_buyout > stock_split > product > other.
+news_lookback_days: 7
+legal_keywords: ["lawsuit", "sues", "sued", "sec investigation", "sec charges", "charged with", "indicted", "class action", "subpoena", "fraud", "settlement", "fine", "probe", "antitrust", "recall"]
+ma_buyout_keywords: ["acquire", "acquisition", "buyout", "takeover", "merger", "tender offer", "to be acquired", "all-cash deal", "go private"]
+stock_split_keywords: ["stock split", "forward split", "reverse split", "share split"]
+product_keywords: ["launch", "unveil", "announce", "release", "new product", "ships", "debut", "reveal"]
+
+# --- Market mood (overall market trend, shown in the dashboard and folded
+# into every candidate's risk_score - see engine.scorer.market_mood_risk_component) --
+market_mood:
+  benchmark: "SPY"              # ticker used as the broad-market trend signal
+  lookback_days: 5               # trading days to look back when computing % change
+  bearish_threshold_pct: -1.5    # benchmark change <= this -> "bearish"
+  bullish_threshold_pct: 1.5     # benchmark change >= this -> "bullish"; between the two -> "neutral"
+
+# --- Live market pulse ------------------------------------------------------
+# Lightweight ETF quotes shown on the dashboard and auto-refreshed by the
+# browser (via /api/market-pulse) every `refresh_seconds` - a cheap,
+# always-on proxy for overall market risk appetite. Independent of the
+# recommendation pipeline below: this just hits each ticker's quick "quote"
+# endpoint (no options chains, no SEC filings), and also opportunistically
+# refreshes market_mood/market_news (still respecting their own TTLs above).
+market_pulse:
+  tickers: ["SPY", "IWM", "QQQ", "USO", "GLD", "TLT"]  # broad market / small-cap / tech / oil / gold / long bonds
+  refresh_seconds: 30
+  sparkline_period: "1d"      # how far back the little trend line next to each tile looks
+  sparkline_interval: "15m"   # bar size for that lookback - a coarse shape, not a trading chart
+
+# Query used to pull market-moving headlines (Fed decisions, macro data,
+# geopolitical events) shown alongside the market mood indicator.
+market_news_query: "stock market OR Federal Reserve OR Fed rate decision OR geopolitical"
+
+# --- Sector performance ------------------------------------------------------
+# % price change per GICS sector over the last `lookback_days`, via the
+# SPDR Select Sector ETFs - the standard, cheap proxy for "how is tech/
+# financials/energy doing" (one ticker per sector, not an average over
+# every S&P 500 constituent). Shown on the dashboard ranked best-to-worst,
+# and used to tag each candidate card with its own sector's recent trend.
+sector_performance:
+  lookback_days: 15
+  tickers:
+    XLK: "Information Technology"
+    XLF: "Financials"
+    XLV: "Health Care"
+    XLY: "Consumer Discretionary"
+    XLC: "Communication Services"
+    XLI: "Industrials"
+    XLP: "Consumer Staples"
+    XLE: "Energy"
+    XLU: "Utilities"
+    XLRE: "Real Estate"
+    XLB: "Materials"
+
+# --- Caching / refresh cadence ----------------------------------------------
+cache_ttl_minutes:
+  options_chain: 20          # intraday - refresh often while market is open
+  price: 15
+  earnings_date: 1440          # once a day
+  analyst_snapshot: 1440        # once a day - consensus rating / price target rarely moves intraday
+  universe_list: 43200         # ~monthly
+  sec_8k: 240                  # every 4 hours
+  sec_13f: 10080                # weekly check (actual filings only land quarterly)
+  news: 120                    # every 2 hours
+  market_mood: 60               # hourly - benchmark trend doesn't need to be intraday-fresh
+  market_news: 60               # hourly
+  technicals: 240                # every 4 hours - the derived RSI/SMA/MACD computation; see price_history below for the raw pull it reads from
+  price_history: 240              # every 4 hours - the shared daily-close cache every signal (technicals, drawdown, post-earnings windows,
+                                   # outcome resolution, market mood, sector performance) reads from; daily-close-based, no need for intraday refresh
+  sparkline: 10                   # every 10 min - the pulse tiles' trend line doesn't need to redraw every 30s tick
+  universe_filter: 10080           # weekly - market cap/avg volume don't need to be fresher than that for this purpose
+  sector_performance: 240          # every 4 hours - a 15-day trend doesn't shift meaningfully more often than that
+
+# --- SEC EDGAR etiquette: SEC requires a descriptive User-Agent with contact info
+sec_user_agent: "StockPutScreener/1.0 (contact: ankur.varsheny@gmail.com)"
+
+# --- Optional auto-refresh while the local dashboard server (app.py) is running.
+# Off by default - recommendations are generated on demand via the dashboard's
+# "Generate recommendations" button (or `python run_pipeline.py`), since the
+# full pipeline hits options chains/SEC filings for the whole universe and
+# isn't something you want kicking off silently. Set enabled: true if you'd
+# rather it refresh automatically each weekday morning. This only fires while
+# `python app.py` / uvicorn is actively running on your machine - it is not a
+# system-level scheduler. For a refresh that happens even when the server
+# isn't running, use cron/launchd with run_pipeline.py directly (see README).
+schedule:
+  enabled: false
+  hour: 9            # local time, see timezone below
+  minute: 35          # 9:35am - a few minutes after the 9:30am US market open
+  timezone: "America/New_York"
+  days_of_week: "mon-fri"
