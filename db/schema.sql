@@ -106,6 +106,10 @@ CREATE TABLE IF NOT EXISTS analyst_snapshot (
     pe_ratio            REAL,       -- trailing P/E
     week52_low          REAL,
     week52_high         REAL,
+    debt_to_equity      REAL,       -- total debt / shareholder equity, as a % (yfinance's raw convention - 150 = 150%, i.e. 1.5x)
+    industry            TEXT,       -- yfinance's finer-grained GICS sub-industry (e.g. "Semiconductors"), distinct from
+                                     -- the broad `universe.sector` (e.g. "Information Technology") - used to diversify
+                                     -- recommendations within a sector that actually spans very different businesses
     updated_at          TEXT NOT NULL
 );
 
@@ -188,6 +192,11 @@ CREATE TABLE IF NOT EXISTS put_candidate (
     pe_ratio          REAL,
     week52_low        REAL,
     week52_high       REAL,
+    debt_to_equity    REAL,       -- total debt / shareholder equity, as a % (yfinance's raw convention)
+    industry          TEXT,       -- GICS sub-industry (e.g. "Semiconductors"), finer than `sector` above - see analyst_snapshot.industry
+    relative_strength_pct REAL,   -- this stock's trend minus the benchmark's, same window - negative means real stock-specific weakness, not just beta
+    historical_median_depth_pct REAL,     -- median depth of this stock's own past qualifying corrections (see drawdown_episode_stats)
+    historical_median_duration_days INTEGER, -- median full time-underwater (peak-to-recovery) of those same past corrections
     earnings_anomaly_type TEXT,
     composite_score   REAL,
     risk_score        REAL,
@@ -239,6 +248,13 @@ CREATE TABLE IF NOT EXISTS dip_candidate (
     pe_ratio          REAL,
     week52_low        REAL,
     week52_high       REAL,
+    debt_to_equity    REAL,       -- total debt / shareholder equity, as a % (yfinance's raw convention)
+    industry          TEXT,       -- GICS sub-industry (e.g. "Semiconductors"), finer than `sector` above - see analyst_snapshot.industry
+    relative_strength_pct REAL,   -- this stock's trend minus the benchmark's, same window - negative means real stock-specific weakness, not just beta
+    historical_median_depth_pct REAL,     -- median depth of this stock's own past qualifying corrections (see drawdown_episode_stats)
+    historical_median_duration_days INTEGER, -- median full time-underwater (peak-to-recovery) of those same past corrections
+    dip_maturity_score REAL,      -- 0-1: how deep/long the CURRENT dip already is vs. that same history (see engine.signals.dip_maturity_score)
+    dip_maturity_label TEXT,      -- 'early' | 'typical' | 'mature' | 'unknown' - classification of dip_maturity_score
     earnings_date         TEXT,     -- next known earnings date, nullable
     earnings_before_horizon INTEGER, -- 1 if earnings_date falls within earnings_alert_days of flagged_date - always
                                       -- shown as a warning badge, not a hard exclusion (see config.yaml)
@@ -288,6 +304,13 @@ CREATE TABLE IF NOT EXISTS three_day_candidate (
     pe_ratio          REAL,
     week52_low        REAL,
     week52_high       REAL,
+    debt_to_equity    REAL,       -- total debt / shareholder equity, as a % (yfinance's raw convention)
+    industry          TEXT,       -- GICS sub-industry (e.g. "Semiconductors"), finer than `sector` above - see analyst_snapshot.industry
+    relative_strength_pct REAL,   -- this stock's trend minus the benchmark's, same window - negative means real stock-specific weakness, not just beta
+    historical_median_depth_pct REAL,     -- median depth of this stock's own past qualifying corrections (see drawdown_episode_stats)
+    historical_median_duration_days INTEGER, -- median full time-underwater (peak-to-recovery) of those same past corrections
+    dip_maturity_score REAL,      -- 0-1: how deep/long the CURRENT dip already is vs. that same history (see engine.signals.dip_maturity_score)
+    dip_maturity_label TEXT,      -- 'early' | 'typical' | 'mature' | 'unknown' - classification of dip_maturity_score
     next_earnings_date      TEXT,     -- next (upcoming) known earnings date, nullable
     earnings_before_horizon INTEGER,  -- 1 if next_earnings_date falls within earnings_alert_days of flagged_date - always
                                        -- shown as a warning badge, not a hard exclusion (see config.yaml)

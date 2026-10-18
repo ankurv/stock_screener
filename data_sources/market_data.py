@@ -82,29 +82,46 @@ def _fast_info_get(info, key: str, default=None):
         return default
 
 
-def fetch_quote(ticker: str) -> Optional[dict]:
+def fetch_quote(db, ticker: str, ttl_minutes: Optional[float] = None) -> Optional[dict]:
     """
-    Lightweight last-price + day-over-day % change via fast_info only (no
-    options chains, no multi-month history) - cheap enough to call for a
-    handful of tickers every 30s for the dashboard's live market pulse.
+    Lightweight live last-price (fast_info, no options chains/multi-month
+    history - cheap enough to call for a handful of tickers every 30s for
+    the dashboard's live market pulse) plus day-over-day % change against
+    the ticker's last *settled* close.
+
+    Deliberately NOT fast_info's own `previousClose` field for that
+    reference point - observed returning a stale/wrong value that doesn't
+    match the ticker's actual last close (a known yfinance quirk,
+    especially for ETFs), which silently showed the wrong day-over-day
+    move. Uses our own price_history cache instead (see
+    refresh_price_history) - the same daily-close series everything else
+    in this app already trusts.
     """
     if yf is None:
         raise RuntimeError("yfinance is not installed - run: pip install -r requirements.txt")
     t = yf.Ticker(ticker)
     try:
-        info = t.fast_info
-        price = _fast_info_get(info, "lastPrice")
-        prev_close = _fast_info_get(info, "previousClose")
-        if not price or not prev_close:
-            return None
-        return {
-            "ticker": ticker,
-            "price": round(float(price), 2),
-            "change_pct": round((float(price) - float(prev_close)) / float(prev_close) * 100.0, 2),
-        }
+        price = _fast_info_get(t.fast_info, "lastPrice")
     except Exception as exc:  # noqa: BLE001
         log.debug("%s: live quote fetch failed (%s)", ticker, exc)
         return None
+    if not price:
+        return None
+
+    closes = refresh_price_history(db, ticker, ttl_minutes=ttl_minutes)
+    if not closes:
+        return None
+    # The most recent cached row can be today's own still-in-progress bar
+    # (refresh_price_history fetches through today) - that's not a settled
+    # close, so fall back to the row before it as "previous close" then.
+    prev_close = closes[-2]["close"] if closes[-1]["date"] == date.today().isoformat() and len(closes) >= 2 else closes[-1]["close"]
+    if not prev_close:
+        return None
+    return {
+        "ticker": ticker,
+        "price": round(float(price), 2),
+        "change_pct": round((float(price) - float(prev_close)) / float(prev_close) * 100.0, 2),
+    }
 
 
 def fetch_market_cap_and_volume(ticker: str) -> Optional[dict]:
@@ -204,6 +221,37 @@ def fetch_daily_history(ticker: str, start: date, end: date) -> Optional[list[di
     return [{"date": d.date().isoformat(), "close": float(c)} for d, c in zip(closes.index, closes)]
 
 
+def _ticker_has_split_since(db, ticker: str, since_date: date, ttl_minutes: float = 1440) -> bool:
+    """
+    Cheap, at-most-once-a-day check (TTL-gated via the generic cache, same
+    mechanism as everything else here) for whether a split landed after
+    `since_date`. yfinance's `.history()` only rebases a ticker's *entire*
+    Close series onto the post-split basis on a fresh pull (confirmed in
+    the installed library's `utils.auto_adjust` - it replaces Close with
+    Adj Close every time); an *incremental* fetch that only asks for days
+    after `since_date` never revisits the already-cached older rows, so
+    they'd stay frozen on the pre-split basis while new days come in
+    post-split - a split-sized fake cliff of our own making. Returning
+    True tells refresh_price_history to force a full re-fetch instead.
+    A failed check leaves the marker unset so the next call retries,
+    rather than silently going blind to splits for a day.
+    """
+    cache_key = f"split_checked_at:{ticker}"
+    if db.cache_get(cache_key, ttl_minutes=ttl_minutes) is not None:
+        return False
+    if yf is None:
+        return False
+    try:
+        splits = yf.Ticker(ticker).splits
+    except Exception as exc:  # noqa: BLE001
+        log.debug("%s: split check failed (%s)", ticker, exc)
+        return False
+    db.cache_set(cache_key, True)
+    if splits is None or splits.empty:
+        return False
+    return any(ts.date() > since_date for ts in splits.index)
+
+
 def refresh_price_history(
     db, ticker: str, ttl_minutes: Optional[float] = None, required_through: Optional[date] = None
 ) -> list[dict]:
@@ -218,7 +266,23 @@ def refresh_price_history(
     The *first* fetch for a ticker pulls the full HISTORY_WINDOW_DAYS
     window; every fetch after that only pulls from (last cached date + 1)
     through today and appends - fetching "the newer data" instead of
-    re-pulling the same ~400 days on every TTL expiry.
+    re-pulling the same ~400 days on every TTL expiry. The one exception:
+    if a split landed since the last cached date (see
+    _ticker_has_split_since), this forces a full re-fetch instead of an
+    incremental one, so the whole series stays rebased consistently.
+
+    A second exception, same idea: if the last cached row IS today, that
+    row can only be a partial/in-progress bar (yfinance's daily `history()`
+    reports the latest trade as "Close" for a day that hasn't finished
+    yet) - re-fetching `last_cached_date + 1` onward would skip right past
+    it and leave it permanently stuck at whatever price was live the
+    moment this function happened to run, silently corrupting every signal
+    that reads it (technicals, drawdown_pct, trend_pct, market mood,
+    sector performance, drawdown_episode_stats...) for good, since nothing
+    ever revisits an already-cached date otherwise. So today's row is
+    always re-fetched (overwriting via upsert_price_history's ON CONFLICT)
+    for as long as it's still today, converging to the true close once the
+    session actually ends instead of freezing on a mid-day snapshot.
 
     `required_through`, if given, forces an incremental fetch (regardless
     of ttl_minutes) when the cached series doesn't yet reach that date -
@@ -234,7 +298,14 @@ def refresh_price_history(
     needs_more = required_through is not None and (last_cached_date is None or last_cached_date < required_through)
 
     if is_stale or needs_more:
-        start = (last_cached_date + timedelta(days=1)) if last_cached_date else (date.today() - timedelta(days=HISTORY_WINDOW_DAYS))
+        needs_full_refetch = last_cached_date is not None and _ticker_has_split_since(db, ticker, last_cached_date)
+        refetch_today = last_cached_date == date.today()
+        start = (
+            last_cached_date if (refetch_today and not needs_full_refetch)
+            else (last_cached_date + timedelta(days=1))
+            if (last_cached_date and not needs_full_refetch)
+            else (date.today() - timedelta(days=HISTORY_WINDOW_DAYS))
+        )
         end = date.today() + timedelta(days=1)
         fetched_ok = start >= end  # nothing new to ask for (already up to date for today) counts as a successful check
         if start < end:
@@ -266,25 +337,146 @@ def fetch_close_price_on_or_after(db, ticker: str, target_date: str, ttl_minutes
     return None
 
 
-def fetch_recent_trend_pct(db, ticker: str, lookback_days: int = 5, ttl_minutes: Optional[float] = None) -> Optional[float]:
-    """% price change over the last `lookback_days` *trading* days - the
-    broad-market trend signal behind fetch_market_mood() below."""
-    closes = refresh_price_history(db, ticker, ttl_minutes=ttl_minutes)
-    if len(closes) < 2:
+def _window(closes: list[dict], lookback_days: int) -> list[dict]:
+    """Last `lookback_days` *trading* days (+1 for the pre-window anchor), ascending - shared windowing
+    convention for every pure signal computed from the cached daily-close series below."""
+    return closes[-(lookback_days + 1):] if len(closes) > lookback_days else closes
+
+
+def trend_pct_from_closes(closes: list[dict], lookback_days: int) -> Optional[float]:
+    """% price change from the start to the end of the window - the plain net-change reading."""
+    window = _window(closes, lookback_days)
+    if len(window) < 2:
         return None
-    window = closes[-(lookback_days + 1):] if len(closes) > lookback_days else closes
     start, end = window[0]["close"], window[-1]["close"]
     if start <= 0:
         return None
     return (end - start) / start * 100.0
 
 
+def max_drawdown_pct(closes: list[dict], lookback_days: int) -> Optional[float]:
+    """
+    Worst peak-to-trough decline within the window (a negative %, or 0.0 if
+    it only ever went up) - catches a sharp sell-off that trend_pct_from_closes'
+    plain start-vs-end change would miss if the window partially recovered
+    afterward (e.g. a sharp 1-day drop mid-week that's since bounced back -
+    net change over the full window can look mild even though it was a real
+    "carnage" day). See classify_market_mood, which checks both.
+    """
+    window = _window(closes, lookback_days)
+    if len(window) < 2:
+        return None
+    peak = window[0]["close"]
+    worst = 0.0
+    for row in window[1:]:
+        price = row["close"]
+        peak = max(peak, price)
+        if peak > 0:
+            worst = min(worst, (price - peak) / peak * 100.0)
+    return round(worst, 2)
+
+
+def drawdown_episode_stats(closes: list[dict], min_episode_depth_pct: float) -> Optional[dict]:
+    """
+    Walks the cached daily-close series (ascending) tracking a running
+    peak, same methodology as max_drawdown_pct but over the *whole*
+    series rather than one fixed window, and splits it into discrete
+    "episodes" every time price makes a new high - closing out whatever
+    underwater stretch preceded it. Only episodes at least
+    min_episode_depth_pct deep count (pass the strategy's own
+    drawdown_threshold_pct so past episodes are measured on the same
+    severity scale that triggers a candidacy today - noise-level dips
+    don't pollute the comparison). Each episode's duration_days is the
+    *full time underwater* (old peak -> the day price first recovers back
+    above it), not just peak-to-trough - the more useful "how long was
+    this stock down for" number, and the trough can land well before the
+    end of that window.
+
+    Lets engine.signals.dip_maturity_score answer "is this stock's current
+    drawdown already as deep/long as its own typical past corrections, or
+    still shallow/short by its own history" - current_depth_pct/
+    current_duration_days are measured from the actual most recent peak,
+    which is a more precise "how deep is this dip really" than a
+    strategy's own fixed-lookback drawdown_pct, and intentionally may not
+    match it exactly.
+
+    Returns None if there's not enough history at all (recent IPO etc.);
+    median_depth_pct/median_duration_days/depth_ratio/duration_ratio stay
+    None (not zero) when there are zero *past* qualifying episodes to
+    compare against - "not enough history to judge," not "typical is 0."
+    """
+    if len(closes) < 30:
+        return None
+    peak = closes[0]["close"]
+    peak_date = date.fromisoformat(closes[0]["date"])
+    episodes: list[dict] = []
+    in_episode = False
+    episode_trough = peak
+
+    for row in closes[1:]:
+        price = row["close"]
+        d = date.fromisoformat(row["date"])
+        if price >= peak:
+            if in_episode and peak > 0:
+                depth_pct = (episode_trough - peak) / peak * 100.0
+                if depth_pct <= min_episode_depth_pct:
+                    episodes.append({"depth_pct": depth_pct, "duration_days": (d - peak_date).days})
+                in_episode = False
+            peak = price
+            peak_date = d
+            episode_trough = price
+        else:
+            in_episode = True
+            episode_trough = min(episode_trough, price)
+
+    current_depth_pct = (closes[-1]["close"] - peak) / peak * 100.0 if peak > 0 else 0.0
+    current_duration_days = (date.fromisoformat(closes[-1]["date"]) - peak_date).days
+
+    result = {
+        "episode_count": len(episodes),
+        "median_depth_pct": None,
+        "median_duration_days": None,
+        "current_depth_pct": round(current_depth_pct, 2),
+        "current_duration_days": current_duration_days,
+        "depth_ratio": None,
+        "duration_ratio": None,
+    }
+    if not episodes:
+        return result
+
+    depths = sorted(e["depth_pct"] for e in episodes)
+    durations = sorted(e["duration_days"] for e in episodes)
+    median_depth = depths[len(depths) // 2]
+    median_duration = durations[len(durations) // 2]
+    result["median_depth_pct"] = round(median_depth, 2)
+    result["median_duration_days"] = median_duration
+    result["depth_ratio"] = round(current_depth_pct / median_depth, 2) if median_depth else None
+    result["duration_ratio"] = round(current_duration_days / median_duration, 2) if median_duration else None
+    return result
+
+
+def fetch_recent_trend_pct(db, ticker: str, lookback_days: int = 5, ttl_minutes: Optional[float] = None) -> Optional[float]:
+    """% price change over the last `lookback_days` *trading* days - the
+    broad-market trend signal behind fetch_market_mood() below."""
+    closes = refresh_price_history(db, ticker, ttl_minutes=ttl_minutes)
+    return trend_pct_from_closes(closes, lookback_days)
+
+
 def classify_market_mood(
-    trend_pct: Optional[float], bearish_threshold_pct: float = -1.5, bullish_threshold_pct: float = 1.5
+    trend_pct: Optional[float], bearish_threshold_pct: float = -1.5, bullish_threshold_pct: float = 1.5,
+    drawdown_pct: Optional[float] = None,
 ) -> str:
+    """
+    Bearish if *either* the net trend crossed the threshold *or* the
+    window's worst peak-to-trough drawdown did (see max_drawdown_pct) - net
+    change alone can wash out a real sharp sell-off that mostly recovered
+    within the same window; checking the worst point too closes that gap.
+    Bullish stays net-change-only - a transient spike up isn't the mirror
+    concern "neutral but there was carnage" is about.
+    """
     if trend_pct is None:
         return "unknown"
-    if trend_pct <= bearish_threshold_pct:
+    if trend_pct <= bearish_threshold_pct or (drawdown_pct is not None and drawdown_pct <= bearish_threshold_pct):
         return "bearish"
     if trend_pct >= bullish_threshold_pct:
         return "bullish"
@@ -334,7 +526,12 @@ def blend_live_mood(
 
     result["live_breadth_pct"] = round(live_breadth_pct, 2)
     result["combined_pct"] = round(combined_pct, 2)
-    result["mood"] = classify_market_mood(combined_pct, bearish_threshold_pct, bullish_threshold_pct)
+    # Carry the structural drawdown through so a sharp sell-off earlier in
+    # the window still keeps the badge honest even once live price bounces
+    # back - otherwise this recompute would silently drop that signal.
+    result["mood"] = classify_market_mood(
+        combined_pct, bearish_threshold_pct, bullish_threshold_pct, drawdown_pct=structural_mood.get("drawdown_pct")
+    )
     return result
 
 
@@ -345,20 +542,41 @@ def fetch_market_mood(
     bearish_threshold_pct: float = -1.5,
     bullish_threshold_pct: float = 1.5,
     ttl_minutes: Optional[float] = None,
+    rate_benchmark: str = "TLT",
 ) -> dict:
     """
     Simple broad-market regime read, used both to show "is the market
     bearish/bullish right now" clearly in the dashboard, and to nudge every
     candidate's risk_score (see engine.signals.market_mood_risk_component) -
     a broad selloff raises assignment/drawdown risk even for low-vol names.
+
+    Also computes the window's max_drawdown_pct alongside the plain
+    trend_pct, so classify_market_mood can catch a sharp sell-off that
+    mostly recovered within the window - plain net change would otherwise
+    read as "neutral" despite a real carnage day in the middle of it.
+
+    rate_trend_pct is TLT's (the long-bond ETF, already tracked for the
+    live pulse tiles) trend over the same window - long bonds selling off
+    is a market-based proxy for rising rates, feeding
+    engine.signals.leverage_risk_component. Cheaper and far more
+    defensible than scoring Fed/CPI headline sentiment by keyword.
     """
-    trend_pct = fetch_recent_trend_pct(db, benchmark, lookback_days, ttl_minutes=ttl_minutes)
-    mood = classify_market_mood(trend_pct, bearish_threshold_pct, bullish_threshold_pct)
+    closes = refresh_price_history(db, benchmark, ttl_minutes=ttl_minutes)
+    trend_pct = trend_pct_from_closes(closes, lookback_days)
+    drawdown_pct = max_drawdown_pct(closes, lookback_days)
+    mood = classify_market_mood(trend_pct, bearish_threshold_pct, bullish_threshold_pct, drawdown_pct=drawdown_pct)
+
+    rate_closes = refresh_price_history(db, rate_benchmark, ttl_minutes=ttl_minutes)
+    rate_trend_pct = trend_pct_from_closes(rate_closes, lookback_days)
+
     return {
         "benchmark": benchmark,
         "lookback_days": lookback_days,
         "trend_pct": round(trend_pct, 2) if trend_pct is not None else None,
+        "drawdown_pct": drawdown_pct,
         "mood": mood,
+        "rate_benchmark": rate_benchmark,
+        "rate_trend_pct": round(rate_trend_pct, 2) if rate_trend_pct is not None else None,
     }
 
 
@@ -378,6 +596,7 @@ def refresh_market_mood(db, cfg: dict) -> dict:
             bearish_threshold_pct=mood_cfg.get("bearish_threshold_pct", -1.5),
             bullish_threshold_pct=mood_cfg.get("bullish_threshold_pct", 1.5),
             ttl_minutes=history_ttl,
+            rate_benchmark=mood_cfg.get("rate_benchmark", "TLT"),
         )
     except Exception as exc:  # noqa: BLE001
         log.warning("Market mood refresh failed: %s", exc)
@@ -502,13 +721,20 @@ def fetch_next_earnings_date(ticker: str) -> tuple[Optional[str], bool]:
 
 def fetch_analyst_snapshot(ticker: str) -> Optional[dict]:
     """
-    Analyst consensus rating + price target, plus a couple of basic
-    valuation/range fundamentals (P/E, 52-week high/low) read from the same
-    `.info` call rather than paying for a second network round-trip just
-    for those - all three come back for most tickers even without analyst
-    coverage (ETFs have no P/E but do have a 52-week range), so this only
-    returns None when there's truly nothing usable at all.
-    recommendation_mean convention: 1.0 = Strong Buy ... 5.0 = Sell.
+    Analyst consensus rating + price target, plus a few basic
+    valuation/leverage fundamentals (P/E, 52-week high/low, debt-to-equity)
+    read from the same `.info` call rather than paying for a second
+    network round-trip just for those - all of them come back for most
+    tickers even without analyst coverage (ETFs have no P/E but do have a
+    52-week range), so this only returns None when there's truly nothing
+    usable at all. debt_to_equity feeds engine.signals.leverage_risk_component -
+    a highly-levered balance sheet is a real risk this screener otherwise
+    never looks at, since nothing else here reads anything off the balance
+    sheet. recommendation_mean convention: 1.0 = Strong Buy ... 5.0 = Sell.
+    `industry` is yfinance's finer-grained GICS sub-industry (e.g.
+    "Semiconductors" vs. the broad "Information Technology" sector) - used
+    to diversify recommendations within a broad sector that actually spans
+    very different businesses (see engine.scorer.diversify_by_sector).
     """
     if yf is None:
         raise RuntimeError("yfinance is not installed - run: pip install -r requirements.txt")
@@ -536,6 +762,8 @@ def fetch_analyst_snapshot(ticker: str) -> Optional[dict]:
         "pe_ratio": pe_ratio,
         "week52_low": week52_low,
         "week52_high": week52_high,
+        "debt_to_equity": info.get("debtToEquity"),
+        "industry": info.get("industry"),
     }
 
 

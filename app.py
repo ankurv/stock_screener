@@ -31,17 +31,18 @@ from fastapi.staticfiles import StaticFiles
 from fastapi.templating import Jinja2Templates
 from starlette.requests import Request
 
-from common import load_config, update_config_values, get_logger
+from common import load_config, update_config_values, get_logger, effective_ttl_minutes
 from db.database import Database
 from data_sources.universe import load_universe, build_universe_filter
 from data_sources.market_data import (
+    fetch_price,
     fetch_quote,
     refresh_market_mood,
     blend_live_mood,
     refresh_sparkline,
     refresh_sector_performance,
 )
-from data_sources.news_rss import refresh_market_news
+from data_sources.news_rss import refresh_market_news, MARKET_NEWS_KEY
 from engine.scorer import RISK_PROFILE_MAX_SCORE
 from engine.outcomes import evaluate_past_recommendations
 from engine.strategies import STRATEGIES
@@ -179,6 +180,25 @@ def _dip_history_summary(history: list[dict]) -> dict:
     }
 
 
+def _attach_live_returns(strat, history: list[dict]):
+    """
+    Fills in `live_return_pct` on every still-pending (outcome not yet set)
+    track-record row, so the dashboard shows an unrealized mark-to-market
+    estimate by default instead of a blank "n/a" until someone clicks the
+    row's manual refresh (⟳) button. Reads the already-cached price_snapshot
+    (db.get_price, no ttl) rather than a fresh live fetch per row - unlike
+    the ⟳ button's /api/history/refresh (which does hit the network and also
+    checks true resolution), this just needs to be cheap enough to run on
+    every dashboard load across up to 50 rows per strategy. Never touches
+    the locked-in `return_pct` column - this is display-only.
+    """
+    for h in history:
+        if h.get("outcome"):
+            continue
+        price = db.get_price(h["ticker"])
+        h["live_return_pct"] = round(strat.live_return_pct(h, price), 2) if price else None
+
+
 @app.get("/", response_class=HTMLResponse)
 def dashboard(request: Request):
     # "Active" = from the latest run and not yet expired/resolved - so a
@@ -192,11 +212,23 @@ def dashboard(request: Request):
     three_day_candidates = db.get_latest_three_day_candidates(active_only=True)
     last_run = db.get_latest_run()
     events_by_ticker = {c["ticker"]: _build_events_for_ticker(c["ticker"]) for c in candidates}
+    all_active_tickers = {c["ticker"] for c in candidates + dip_candidates + three_day_candidates}
+    # The 'stock_split' news category (data_sources.news_rss) was being
+    # classified and stored but never actually shown anywhere - checked
+    # here, at render time, rather than baked into each candidate row,
+    # since it's "FYI as of right now" context, not a locked-in fact from
+    # whenever the row was generated.
+    recent_split_tickers = {
+        t for t in all_active_tickers if any(n.get("category") == "stock_split" for n in db.get_news(t, limit=10))
+    }
     history = db.get_recommendation_history(limit=50)
     dip_history = db.get_dip_history(limit=50)
     three_day_history = db.get_three_day_history(limit=50)
+    _attach_live_returns(STRATEGIES["cash_secured_put"], history)
+    _attach_live_returns(STRATEGIES["dip_buy"], dip_history)
+    _attach_live_returns(STRATEGIES["three_day_rule"], three_day_history)
     market_mood = _pulse_cache.get("market_mood") or db.get_market_mood() or {}
-    market_news = _pulse_cache.get("market_news") or db.get_market_news() or []
+    market_news = _pulse_cache.get("market_news") or db.get_news(MARKET_NEWS_KEY, limit=8) or []
     pulse_by_ticker = {q["ticker"]: q for q in _pulse_cache.get("pulse", [])}
     sector_performance = _pulse_cache.get("sector_performance") or db.get_sector_performance() or []
     sector_trend_by_name = {s["sector"]: s["trend_pct"] for s in sector_performance}
@@ -209,9 +241,10 @@ def dashboard(request: Request):
             "dip_candidates": dip_candidates,
             "three_day_candidates": three_day_candidates,
             "events_by_ticker": events_by_ticker,
+            "recent_split_tickers": recent_split_tickers,
             "last_run": last_run,
             "max_candidates": csp_cfg.get("max_candidates", 10),
-            "risk_profile": csp_cfg.get("risk_profile", "balanced"),
+            "risk_profile": cfg.get("risk_profile", "balanced"),
             "market_mood": market_mood,
             "market_news": market_news,
             "market_pulse_tickers": cfg.get("market_pulse", {}).get("tickers", []),
@@ -245,11 +278,12 @@ def market_pulse():
     """
     pulse_cfg = cfg.get("market_pulse", {})
     mood_cfg = cfg.get("market_mood", {})
+    history_ttl = effective_ttl_minutes(cfg.get("cache_ttl_minutes", {}).get("price_history", 240))
     quotes = []
     failed_tickers = []
     for ticker in pulse_cfg.get("tickers", []):
         try:
-            quote = fetch_quote(ticker)
+            quote = fetch_quote(db, ticker, ttl_minutes=history_ttl)
         except Exception as exc:  # noqa: BLE001
             log.warning("Live quote fetch failed for %s: %s", ticker, exc)
             quote = None
@@ -279,7 +313,7 @@ def market_pulse():
         market_news = refresh_market_news(db, cfg)
     except Exception as exc:  # noqa: BLE001
         log.warning("Market news refresh failed: %s", exc)
-        market_news = db.get_market_news() or []
+        market_news = db.get_news(MARKET_NEWS_KEY, limit=8) or []
 
     try:
         sector_performance = refresh_sector_performance(db, cfg)
@@ -344,6 +378,26 @@ def api_three_day_candidates():
     return JSONResponse(db.get_latest_three_day_candidates(active_only=True))
 
 
+@app.post("/api/refresh-price")
+def refresh_price(ticker: str = Form(...)):
+    """
+    The per-card refresh button - forces a live price fetch for this one
+    ticker, bypassing cache_ttl_minutes.price, instead of waiting for it to
+    naturally go stale. Only updates the shared live price_snapshot (see
+    db.upsert_price) for display - never a candidate row's own `price`
+    column, which is the entry price at flag time and must stay fixed for
+    return_pct to be computed correctly once resolved.
+    """
+    try:
+        price = fetch_price(ticker)
+    except Exception as exc:  # noqa: BLE001
+        return JSONResponse({"error": f"Couldn't refresh {ticker}: {exc}"}, status_code=502)
+    if not price:
+        return JSONResponse({"error": f"No live price available for {ticker} right now."}, status_code=502)
+    db.upsert_price(ticker, price)
+    return JSONResponse({"ticker": ticker, "price": round(price, 2)})
+
+
 @app.post("/api/decide")
 def decide_candidate(
     strategy: str = Form(...),
@@ -390,6 +444,65 @@ def delete_history_entry(
     return JSONResponse({"status": "ok"})
 
 
+@app.post("/api/history/refresh")
+def refresh_history_outcome(
+    strategy: str = Form(...),
+    run_id: int = Form(...),
+    ticker: str = Form(...),
+    expiry: Optional[str] = Form(None),
+    strike: Optional[float] = Form(None),
+    flagged_date: Optional[str] = Form(None),
+):
+    """
+    The track record's manual "check now" button on a still-pending
+    (decided but unresolved) row - tries to resolve it on demand instead
+    of waiting for the next server-startup sweep (see engine.outcomes.
+    evaluate_past_recommendations), using the exact same per-strategy
+    resolve_outcome/record_outcome. Returns status 'resolved' with the
+    locked-in fresh values if it's officially due and the data exists for
+    it; otherwise 'not_ready', but still with a live mark-to-market
+    live_return_pct (see each strategy's live_return_pct) - the user wants
+    a current return on click either way, not just once it's resolved.
+    That preview is NEVER written to the return_pct column - only
+    record_outcome ever locks that in, exactly once.
+    """
+    strat = STRATEGIES.get(strategy)
+    if strat is None:
+        return JSONResponse({"error": f"Unknown strategy: {strategy}"}, status_code=400)
+    rec = {"run_id": run_id, "ticker": ticker, "expiry": expiry, "strike": strike, "flagged_date": flagged_date}
+    full_rec = strat.get_row(db, rec)
+    if full_rec is None:
+        return JSONResponse({"error": "Row not found."}, status_code=404)
+    if full_rec.get("outcome") is not None:
+        return JSONResponse({"status": "already_resolved"})
+    try:
+        result = strat.resolve_outcome(db, full_rec, cfg)
+    except Exception as exc:  # noqa: BLE001
+        return JSONResponse({"error": f"Couldn't check outcome: {exc}"}, status_code=502)
+    if result is not None:
+        outcome, resolved_price = result
+        strat.record_outcome(db, full_rec, outcome, resolved_price)
+        updated = strat.get_row(db, rec)
+        return JSONResponse({
+            "status": "resolved",
+            "outcome": updated["outcome"],
+            "resolved_price": updated.get("resolved_price", updated.get("expiry_close_price")),
+            "return_pct": updated.get("return_pct"),
+            "evaluated_at": updated.get("evaluated_at"),
+        })
+
+    try:
+        live_price = fetch_price(ticker)
+    except Exception:  # noqa: BLE001
+        live_price = None
+    live_return = strat.live_return_pct(full_rec, live_price) if live_price else None
+    return JSONResponse({
+        "status": "not_ready",
+        "live_price": round(live_price, 2) if live_price else None,
+        "live_return_pct": round(live_return, 2) if live_return is not None else None,
+    })
+
+
 @app.post("/settings")
 def update_settings(
     max_candidates: int = Form(...),
@@ -402,14 +515,14 @@ def update_settings(
             {"error": f"Risk profile must be one of: {', '.join(RISK_PROFILE_MAX_SCORE)}."}, status_code=400
         )
     global cfg
-    cfg = update_config_values(
-        {
-            # Dotted path: "max_candidates" also exists under strategies.dip_buy,
-            # so the plain leaf name alone would be ambiguous (see common.update_config_values).
-            "strategies.cash_secured_put.max_candidates": max_candidates,
-            "risk_profile": f'"{risk_profile}"',
-        }
-    )
+    updates = {
+        # Dotted path: "max_candidates" exists under every strategy, so the
+        # plain leaf name alone would be ambiguous (see common.
+        # update_config_values) - applies to all of them, not just CSP.
+        f"strategies.{name}.max_candidates": max_candidates for name in STRATEGIES
+    }
+    updates["risk_profile"] = f'"{risk_profile}"'
+    cfg = update_config_values(updates)
     return JSONResponse({"status": "ok"})
 
 

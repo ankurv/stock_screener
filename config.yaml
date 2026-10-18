@@ -85,15 +85,16 @@ strategies:
                                               # is a ceiling-independent cutoff: a run can legitimately return fewer
                                               # than max_candidates, including zero, if nothing clears this bar - that's
                                               # the system saying "nothing good right now", not a bug.
-    max_per_sector: 2                        # at most this many picks from the same sector - without this, "top N by
-                                              # score" can hand back N names that are all one hot sector, which isn't
-                                              # really diversified (they'll tend to move together). Backfilled with
-                                              # same-sector picks only if there genuinely aren't enough other sectors
-                                              # to fill max_candidates (see engine.scorer.diversify_by_sector).
-    risk_profile: "aggressive"               # conservative|balanced|aggressive - caps which candidates are eligible by
-                                            # their 1-10 risk_score (dominated by implied vol): conservative <= 3,
-                                            # balanced <= 6, aggressive <= 10 (no extra filter). Also editable from the
-                                            # dashboard's Settings panel.
+    max_per_sector: 5                        # at most this many picks from the same (sector, sub-industry) group -
+                                              # without this, "top N by score" can hand back N names that are all one
+                                              # hot sector, which isn't really diversified (they'll tend to move
+                                              # together). Grouped on the finer-grained GICS sub-industry when known,
+                                              # not just the broad sector - "Information Technology" alone spans very
+                                              # different businesses (chipmakers, software, hardware), so capping on
+                                              # sector alone was starving the result down to a couple of names. No
+                                              # backfill: if the qualifying pool is thin on variety, a run can
+                                              # legitimately return fewer than max_candidates (see
+                                              # engine.scorer.diversify_by_sector).
     min_annualized_yield_pct: 8.0          # filter out puts yielding less than this annualized
     min_bid_price: 0.50                    # hard filter: bids below this are dropped - brokerage commissions eat most/all of a premium that cheap
     min_open_interest: 50                  # liquidity floor
@@ -102,6 +103,15 @@ strategies:
     exclude_if_earnings_before_expiry: false  # true = hard filter out; false = just flag + score penalty
     strike_otm_pct_max: 5.0                 # hard filter: strike must be within this % below current price (0% = ATM)
     strike_otm_pct_max_with_earnings: 15.0  # wider band when earnings falls before expiry - worth the extra distance for the event risk
+    relative_strength_lookback_days: 10     # window (trading days) used to compare this stock's own trend against SPY's
+                                             # over the same period - a cash-secured put should be sold on names you're
+                                             # fine holding if assigned, so chronic underperformance vs. the market is a
+                                             # risk-score factor (see engine.signals.relative_weakness_risk_component)
+    historical_drawdown_min_depth_pct: -15.0  # a past correction must have been at least this deep to count as a
+                                               # qualifying "episode" when judging this stock's own drawdown history
+                                               # (see data_sources.market_data.drawdown_episode_stats) - a stock with a
+                                               # history of deep/long corrections is a worse CSP pick even if today's
+                                               # contract terms look attractive (engine.signals.historical_drawdown_risk_component)
     # Ranking weights (composite score; positive weights should sum to ~1.0,
     # earnings_penalty is subtracted on top, it's not part of that sum)
     weights:
@@ -139,20 +149,31 @@ strategies:
     max_candidates: 10                # how many names to surface per run, ranked by composite_score
     min_composite_score: 0.35          # soft quality floor beyond the hard filters above - fine (expected) for a run
                                         # to return fewer than max_candidates, including zero, if nothing clears this
-    max_per_sector: 2                  # at most this many picks from the same sector - see strategies.cash_secured_put's
-                                        # identical setting / engine.scorer.diversify_by_sector for the full rationale
+    max_per_sector: 5                  # at most this many picks from the same (sector, sub-industry) group - see
+                                        # strategies.cash_secured_put's identical setting / engine.scorer.diversify_by_sector
+                                        # for the full rationale
     weights:
-      drawdown: 0.4
-      oversold: 0.3
-      analyst_sentiment: 0.3
+      drawdown: 0.35
+      oversold: 0.25
+      analyst_sentiment: 0.25
+      maturity: 0.15   # how deep/long the CURRENT dip already is vs. this stock's own past corrections -
+                        # see engine.signals.dip_maturity_score / data_sources.market_data.drawdown_episode_stats;
+                        # a dip that already looks "mature" by the stock's own history is a somewhat more attractive entry
     # Risk-score blend (sums to 1.0) - technical dominates, with market mood,
     # sector weakness (is the whole sector also correcting, not just this
-    # name?), and the earnings-timing alert each a secondary factor.
+    # name?), earnings-timing, balance-sheet leverage (see engine.
+    # signals.leverage_risk_component - amplified when the rate environment
+    # is tightening, read from market_mood.rate_trend_pct), and relative
+    # weakness vs. the broad market (engine.signals.
+    # relative_weakness_risk_component - is this really a market-wide move,
+    # or a real stock-specific problem?) each a secondary factor.
     risk_weights:
-      technical: 0.4
-      market_mood: 0.2
-      sector: 0.2
+      technical: 0.2
+      market_mood: 0.1
+      sector: 0.1
       earnings: 0.2
+      leverage: 0.2
+      relative_weakness: 0.2
 
   # --- 3-Day Rule --------------------------------------------------------------
   # A stock often keeps correcting for ~3 trading days right after it reports
@@ -181,23 +202,34 @@ strategies:
     max_candidates: 10                # how many names to surface per run, ranked by composite_score
     min_composite_score: 0.35          # soft quality floor beyond the hard filters above - fine (expected) for a run
                                         # to return fewer than max_candidates, including zero, if nothing clears this
-    max_per_sector: 2                  # at most this many picks from the same sector - see strategies.cash_secured_put's
-                                        # identical setting / engine.scorer.diversify_by_sector for the full rationale
+    max_per_sector: 5                  # at most this many picks from the same (sector, sub-industry) group - see
+                                        # strategies.cash_secured_put's identical setting / engine.scorer.diversify_by_sector
+                                        # for the full rationale
     weights:
-      drawdown: 0.35
-      down_days: 0.15
-      oversold: 0.2
+      drawdown: 0.3
+      down_days: 0.1
+      oversold: 0.15
       analyst_sentiment: 0.3
+      maturity: 0.15   # see dip_buy.weights.maturity above - same signal, same rationale
     # Risk-score blend (sums to 1.0) - technical and the earnings-timing
-    # alert carry equal top weight here, with market mood and sector
-    # weakness as secondary factors.
+    # alert carry equal top weight here, with market mood, sector
+    # weakness, balance-sheet leverage (see engine.signals.
+    # leverage_risk_component), and relative weakness vs. the broad market
+    # (engine.signals.relative_weakness_risk_component) as secondary factors.
     risk_weights:
-      technical: 0.3
-      market_mood: 0.2
-      sector: 0.2
-      earnings: 0.3
+      technical: 0.2
+      market_mood: 0.1
+      sector: 0.1
+      earnings: 0.2
+      leverage: 0.2
+      relative_weakness: 0.2
 
 risk_free_rate: 0.045                  # used for Black-Scholes probability-OTM estimate (CSP-only consumer, kept global as a market constant)
+
+risk_profile: "aggressive"             # conservative|balanced|aggressive - shared across every strategy, each of which
+                                        # computes its own candidates' 1-10 risk_score on the same scale - caps which
+                                        # candidates are eligible: conservative <= 3, balanced <= 6, aggressive <= 10
+                                        # (no extra filter). Also editable from the dashboard's Settings panel.
 post_earnings_anomaly_threshold_pct: 3.0  # price move needed, against the EPS-surprise direction, to flag an anomaly (shared data-refresh step)
 
 

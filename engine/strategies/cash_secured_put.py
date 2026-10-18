@@ -11,7 +11,7 @@ from datetime import datetime, timedelta, timezone
 from typing import Optional
 
 from common import effective_ttl_minutes
-from data_sources.market_data import fetch_close_price_on_or_after
+from data_sources.market_data import fetch_close_price_on_or_after, fetch_recent_trend_pct, drawdown_episode_stats
 from engine.scorer import evaluate_candidates, select_top_candidates
 
 KEY = "cash_secured_put"
@@ -31,10 +31,12 @@ def _flat_cfg(cfg: dict) -> dict:
     engine.scorer's functions predate the multi-strategy config nesting and
     just expect one flat dict of CSP settings - this builds that from
     cfg["strategies"]["cash_secured_put"] plus the global risk_free_rate
-    (a market constant, not CSP-specific, so it stays top-level in config.yaml).
+    (a market constant, not CSP-specific) and risk_profile (shared across
+    every strategy - see config.yaml), both of which stay top-level.
     """
     flat = dict(cfg.get("strategies", {}).get("cash_secured_put", {}))
     flat["risk_free_rate"] = cfg.get("risk_free_rate", 0.045)
+    flat["risk_profile"] = cfg.get("risk_profile", "balanced")
     return flat
 
 
@@ -46,6 +48,17 @@ def generate(db, cfg: dict, universe: list[dict]) -> list[dict]:
     # Don't re-surface a ticker you already accepted or ignored recently -
     # you made a call on it, no need to see it again right away.
     snoozed = db.get_recent_decided_tickers("put_candidate", cooldown_cutoff)
+    # A cash-secured put should be sold on names you're fine holding if
+    # assigned - these two feed exactly that "how risky is this stock to
+    # own, independent of today's contract terms" question (see engine.
+    # scorer.evaluate_candidates / engine.signals.relative_weakness_risk_component
+    # and historical_drawdown_risk_component), same signals dip_buy/
+    # three_day_rule use to judge a dip, applied here as a standing risk
+    # read instead. Fetched once, not per-ticker - same value for everyone.
+    relative_strength_lookback_days = strat_cfg.get("relative_strength_lookback_days", 10)
+    historical_drawdown_min_depth_pct = strat_cfg.get("historical_drawdown_min_depth_pct", -15.0)
+    history_ttl = effective_ttl_minutes(cfg.get("cache_ttl_minutes", {}).get("price_history", 240))
+    spy_trend_pct = fetch_recent_trend_pct(db, "SPY", relative_strength_lookback_days, ttl_minutes=history_ttl)
 
     all_candidates = []
     for row in universe:
@@ -64,6 +77,10 @@ def generate(db, cfg: dict, universe: list[dict]) -> list[dict]:
         earnings_reaction = db.get_post_earnings_reaction(ticker)
         technicals = db.get_technicals(ticker)
 
+        stock_trend_pct = fetch_recent_trend_pct(db, ticker, relative_strength_lookback_days, ttl_minutes=history_ttl)
+        relative_strength_pct = (stock_trend_pct - spy_trend_pct) if (stock_trend_pct is not None and spy_trend_pct is not None) else None
+        historical_drawdown_stats = drawdown_episode_stats(db.get_price_history(ticker), historical_drawdown_min_depth_pct)
+
         cands = evaluate_candidates(
             ticker=ticker,
             company_name=row.get("company_name"),
@@ -76,6 +93,8 @@ def generate(db, cfg: dict, universe: list[dict]) -> list[dict]:
             market_mood=market_mood,
             technicals=technicals,
             sector=row.get("sector"),
+            relative_strength_pct=relative_strength_pct,
+            historical_drawdown_stats=historical_drawdown_stats,
         )
         all_candidates.extend(cands)
 
@@ -145,6 +164,21 @@ def record_outcome(db, rec: dict, outcome: str, resolved_price: float):
 
 def record_decision(db, rec: dict, decision: str):
     db.record_candidate_decision(rec["run_id"], rec["ticker"], rec["expiry"], rec["strike"], decision)
+
+
+def live_return_pct(rec: dict, current_price: float) -> Optional[float]:
+    """
+    Unrealized mark-to-market read for a still-pending row - same formula
+    as realized_return_pct, just fed the current live price instead of the
+    expiry close. Never stored (see app.py's /api/history/refresh) - the
+    locked-in return_pct column is only ever written once by record_outcome.
+    """
+    return realized_return_pct(rec["strike"], rec["bid"], current_price, rec["collateral"])
+
+
+def get_row(db, rec: dict) -> Optional[dict]:
+    """Full row by natural key - see the track record's manual 'check now' outcome refresh in app.py."""
+    return db.get_candidate_row(rec["run_id"], rec["ticker"], rec["expiry"], rec["strike"])
 
 
 def delete_history_row(db, rec: dict):

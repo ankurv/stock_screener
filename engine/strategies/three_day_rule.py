@@ -33,13 +33,19 @@ from datetime import date, datetime, timedelta, timezone
 from typing import Optional
 
 from common import effective_ttl_minutes
-from data_sources.market_data import fetch_post_earnings_correction, fetch_close_price_on_or_after
-from engine.scorer import diversify_by_sector
+from data_sources.market_data import (
+    fetch_post_earnings_correction, fetch_close_price_on_or_after, fetch_recent_trend_pct, drawdown_episode_stats,
+)
+from engine.scorer import diversify_by_sector, RISK_PROFILE_MAX_SCORE
 from engine.signals import (
     market_mood_risk_component,
     technical_risk_component,
     analyst_sentiment_score,
     analyst_upside_pct,
+    leverage_risk_component,
+    relative_weakness_risk_component,
+    dip_maturity_score,
+    classify_dip_maturity,
 )
 
 KEY = "three_day_rule"
@@ -63,14 +69,16 @@ def _parse_date(d: Optional[str]) -> Optional[date]:
 
 def _risk_score(
     technical_component: float, market_mood_component: float, sector_component: float,
-    earnings_component: float, weights: dict,
+    earnings_component: float, leverage_component: float, relative_weakness_component: float, weights: dict,
 ) -> tuple[int, str]:
     """Same 1-10 scale/labels and blend shape as dip_buy._risk_score, for consistent badges across strategies."""
     raw = (
-        weights.get("technical", 0.3) * technical_component
-        + weights.get("market_mood", 0.2) * market_mood_component
-        + weights.get("sector", 0.2) * sector_component
-        + weights.get("earnings", 0.3) * earnings_component
+        weights.get("technical", 0.2) * technical_component
+        + weights.get("market_mood", 0.1) * market_mood_component
+        + weights.get("sector", 0.1) * sector_component
+        + weights.get("earnings", 0.2) * earnings_component
+        + weights.get("leverage", 0.2) * leverage_component
+        + weights.get("relative_weakness", 0.2) * relative_weakness_component
     )
     score = max(1, min(10, round(1 + raw * 9)))
     label = "Low" if score <= 3 else "Medium" if score <= 6 else "High"
@@ -92,6 +100,10 @@ def generate(db, cfg: dict, universe: list[dict]) -> list[dict]:
     max_per_sector = strat_cfg.get("max_per_sector", 2)
     weights = strat_cfg.get("weights", {})
     risk_weights = strat_cfg.get("risk_weights", {})
+    # Shared across every strategy (see config.yaml's top-level risk_profile) -
+    # caps which candidates are eligible by their own 1-10 risk_score, same
+    # scale/meaning as cash_secured_put's identical gate.
+    max_risk_score = RISK_PROFILE_MAX_SCORE.get(cfg.get("risk_profile", "balanced"), 6)
 
     market_mood = db.get_market_mood() or {}
     mood_component = market_mood_risk_component(market_mood.get("trend_pct"))
@@ -101,6 +113,10 @@ def generate(db, cfg: dict, universe: list[dict]) -> list[dict]:
     flagged_date = today.isoformat()
     earnings_alert_cutoff = today + timedelta(days=earnings_alert_days)
     history_ttl = effective_ttl_minutes(cfg.get("cache_ttl_minutes", {}).get("price_history", 240))
+    # Same 3-day window as the correction itself, so relative_strength_pct
+    # below is a fair apples-to-apples comparison - fetched once, not
+    # per-ticker, since it's the same value for everyone this run.
+    spy_trend_pct = fetch_recent_trend_pct(db, "SPY", lookback_days=3, ttl_minutes=history_ttl)
     cooldown_days = cfg.get("decision_cooldown_days", 7)
     cooldown_cutoff = (datetime.now(timezone.utc) - timedelta(days=cooldown_days)).isoformat()
     # Don't re-surface a ticker you already accepted or ignored recently.
@@ -156,21 +172,35 @@ def generate(db, cfg: dict, universe: list[dict]) -> list[dict]:
         next_earnings_date = _parse_date((next_earnings or {}).get("earnings_date"))
         earnings_before_horizon = bool(next_earnings_date and today <= next_earnings_date <= earnings_alert_cutoff)
 
+        # How much of this correction is just the broad market, vs. a real
+        # stock-specific problem - and how deep/long this stock's dips
+        # typically run, to judge whether this one already looks "done."
+        relative_strength_pct = (window["drawdown_pct"] - spy_trend_pct) if spy_trend_pct is not None else None
+        episode_stats = drawdown_episode_stats(db.get_price_history(ticker), drawdown_threshold_pct) or {}
+        maturity_score = dip_maturity_score(episode_stats.get("depth_ratio"), episode_stats.get("duration_ratio"))
+        maturity_label = classify_dip_maturity(maturity_score)
+
         tech_component = technical_risk_component(technicals)
         sector_component = market_mood_risk_component(sector_trend_by_name.get(row.get("sector")), max_swing_pct=10.0)
         earnings_component = 1.0 if earnings_before_horizon else 0.0
+        leverage_component = leverage_risk_component((analyst or {}).get("debt_to_equity"), market_mood.get("rate_trend_pct"))
+        relative_weakness_component = relative_weakness_risk_component(relative_strength_pct)
         # Normalized 0-1: right at the threshold -> 0.5, twice the threshold -> 1.0 (capped).
         drawdown_component = min(abs(window["drawdown_pct"]) / abs(drawdown_threshold_pct) / 2.0, 1.0)
         down_days_component = window["down_day_count"] / 3.0
         oversold_component = max(0.0, (rsi_oversold_max - rsi) / rsi_oversold_max)
 
         composite = (
-            weights.get("drawdown", 0.35) * drawdown_component
-            + weights.get("down_days", 0.15) * down_days_component
-            + weights.get("oversold", 0.2) * oversold_component
+            weights.get("drawdown", 0.3) * drawdown_component
+            + weights.get("down_days", 0.1) * down_days_component
+            + weights.get("oversold", 0.15) * oversold_component
             + weights.get("analyst_sentiment", 0.3) * a_score
+            + weights.get("maturity", 0.15) * (maturity_score or 0.0)
         )
-        risk_score, risk_label = _risk_score(tech_component, mood_component, sector_component, earnings_component, risk_weights)
+        risk_score, risk_label = _risk_score(
+            tech_component, mood_component, sector_component, earnings_component,
+            leverage_component, relative_weakness_component, risk_weights,
+        )
         upside_pct = analyst_upside_pct(analyst, price)
 
         results.append(
@@ -196,6 +226,13 @@ def generate(db, cfg: dict, universe: list[dict]) -> list[dict]:
                 "pe_ratio": (analyst or {}).get("pe_ratio"),
                 "week52_low": (analyst or {}).get("week52_low"),
                 "week52_high": (analyst or {}).get("week52_high"),
+                "debt_to_equity": (analyst or {}).get("debt_to_equity"),
+                "industry": (analyst or {}).get("industry"),
+                "relative_strength_pct": round(relative_strength_pct, 2) if relative_strength_pct is not None else None,
+                "historical_median_depth_pct": episode_stats.get("median_depth_pct"),
+                "historical_median_duration_days": episode_stats.get("median_duration_days"),
+                "dip_maturity_score": round(maturity_score, 2) if maturity_score is not None else None,
+                "dip_maturity_label": maturity_label,
                 "next_earnings_date": next_earnings_date.isoformat() if next_earnings_date else None,
                 "earnings_before_horizon": int(earnings_before_horizon),
                 "composite_score": round(composite, 4),
@@ -208,7 +245,10 @@ def generate(db, cfg: dict, universe: list[dict]) -> list[dict]:
     # Soft quality floor on top of the hard filters above - returning fewer
     # than max_candidates (including zero) is expected and correct when
     # nothing clears this bar, not a bug to work around.
-    qualified = [c for c in results if c["composite_score"] >= min_composite_score]
+    qualified = [
+        c for c in results
+        if c["composite_score"] >= min_composite_score and c["risk_score"] <= max_risk_score
+    ]
     qualified.sort(key=lambda c: c["composite_score"], reverse=True)
     # Sector-capped (see engine.scorer.diversify_by_sector) so a strong week
     # doesn't hand back max_candidates names that are all the same sector.
@@ -266,6 +306,21 @@ def record_outcome(db, rec: dict, outcome: str, resolved_price: float):
 
 def record_decision(db, rec: dict, decision: str):
     db.record_three_day_decision(rec["run_id"], rec["ticker"], rec["flagged_date"], decision)
+
+
+def live_return_pct(rec: dict, current_price: float) -> Optional[float]:
+    """
+    Unrealized mark-to-market read for a still-pending row - same formula
+    as record_outcome's, just fed the current live price instead of the
+    resolved price. Never stored (see app.py's /api/history/refresh) - the
+    locked-in return_pct column is only ever written once by record_outcome.
+    """
+    return (current_price - rec["price"]) / rec["price"] * 100.0 if rec.get("price") else None
+
+
+def get_row(db, rec: dict) -> Optional[dict]:
+    """Full row by natural key - see the track record's manual 'check now' outcome refresh in app.py."""
+    return db.get_three_day_candidate_row(rec["run_id"], rec["ticker"], rec["flagged_date"])
 
 
 def delete_history_row(db, rec: dict):

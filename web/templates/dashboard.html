@@ -50,6 +50,12 @@
     <span class="muted" id="mood-detail">
       {% if market_mood.get('trend_pct') is not none %}
         {{ market_mood.get('benchmark') }} {{ "%+.2f"|format(market_mood.get('trend_pct')) }}% over last {{ market_mood.get('lookback_days') }} trading days
+        {% if market_mood.get('drawdown_pct') is not none and market_mood.get('drawdown_pct') < 0 %}
+          (worst: {{ "%.2f"|format(market_mood.get('drawdown_pct')) }}%)
+        {% endif %}
+        {% if market_mood.get('rate_trend_pct') is not none and market_mood.get('rate_trend_pct') <= -2.0 %}
+          &middot; {{ market_mood.get('rate_benchmark') }} {{ "%+.2f"|format(market_mood.get('rate_trend_pct')) }}% (rates tightening - amplifies leveraged names' risk)
+        {% endif %}
       {% endif %}
     </span>
     <span class="muted">Factored into every candidate's risk score below.</span>
@@ -86,10 +92,10 @@
 <details class="settings-panel">
   <summary>Settings</summary>
   <form id="settings-form" onsubmit="saveSettings(event)">
-    <label>Max recommendations (cash-secured puts)
+    <label>Max recommendations (per strategy)
       <input type="text" inputmode="numeric" pattern="[0-9]*" name="max_candidates" value="{{ max_candidates }}" required>
     </label>
-    <label>Risk profile
+    <label>Risk profile (all strategies)
       <select name="risk_profile">
         <option value="conservative" {% if risk_profile == "conservative" %}selected{% endif %}>Conservative (risk 1-3)</option>
         <option value="balanced" {% if risk_profile == "balanced" %}selected{% endif %}>Balanced (risk 1-6)</option>
@@ -133,8 +139,8 @@
     <summary>Recommendations ({{ candidates|length }})</summary>
   <div class="candidates">
     {% for c in candidates %}
-    <details class="candidate-card {{ 'top-pick' if c.rank == 1 else '' }}">
-      <summary class="candidate-summary">
+    <div class="candidate-card {{ 'top-pick' if c.rank == 1 else '' }}">
+      <div class="candidate-summary">
         <span class="rank-badge-sm">#{{ c.rank }}</span>
         <span class="dip-card-ticker">{{ c.ticker }}</span>
         <span class="current-price">${{ "%.2f"|format(c.price) if c.price is not none else "n/a" }}</span>
@@ -144,7 +150,13 @@
         <span class="metric-value highlight">{{ "%.1f"|format(c.annualized_yield_pct) }}%</span>
         <span class="metric-value risk-{{ (c.risk_label or "")|lower }}">{{ c.risk_label }}</span>
         <span class="dip-card-score">{{ "%.3f"|format(c.composite_score) }}</span>
-      </summary>
+        <button class="refresh-price-btn" title="Refresh live price" onclick="refreshPrice(this, '{{ c.ticker }}')">⟳</button>
+        <button class="accept-icon-btn" title="Accept" onclick="decideCandidate(this, 'cash_secured_put', 'accepted')"
+          data-run-id="{{ c.run_id }}" data-ticker="{{ c.ticker }}" data-expiry="{{ c.expiry }}" data-strike="{{ c.strike }}">✓</button>
+        <button class="ignore-icon-btn" title="Ignore" onclick="decideCandidate(this, 'cash_secured_put', 'ignored')"
+          data-run-id="{{ c.run_id }}" data-ticker="{{ c.ticker }}" data-expiry="{{ c.expiry }}" data-strike="{{ c.strike }}">✕</button>
+        <button class="expand-toggle-btn" title="Show more details" onclick="toggleCardBody(this)">▸</button>
+      </div>
       <div class="candidate-body">
       <div class="company-name">{{ c.company_name or "" }}</div>
 
@@ -164,13 +176,19 @@
         <div class="metric"><span class="metric-label">MACD</span><span class="metric-value">{{ "Bullish" if c.macd_bullish == 1 else "Bearish" if c.macd_bullish == 0 else "n/a" }}</span></div>
         <div class="metric"><span class="metric-label">P/E (trailing)</span><span class="metric-value">{{ "%.1f"|format(c.pe_ratio) if c.pe_ratio is not none else "n/a" }}</span></div>
         <div class="metric"><span class="metric-label">52wk range</span><span class="metric-value">{{ "${:.0f}".format(c.week52_low) if c.week52_low is not none else "n/a" }} - {{ "${:.0f}".format(c.week52_high) if c.week52_high is not none else "n/a" }}</span></div>
+        <div class="metric"><span class="metric-label">Debt/Equity</span><span class="metric-value {{ 'risk-high' if c.debt_to_equity is not none and c.debt_to_equity >= 200 else '' }}">{{ "%.0f%%"|format(c.debt_to_equity) if c.debt_to_equity is not none else "n/a" }}</span></div>
+        <div class="metric"><span class="metric-label">vs Market</span><span class="metric-value {{ 'risk-high' if c.relative_strength_pct is not none and c.relative_strength_pct <= -15 else '' }}">{{ "%+.1f%%"|format(c.relative_strength_pct) if c.relative_strength_pct is not none else "n/a" }} <span class="muted">vs SPY</span></span></div>
+        <div class="metric"><span class="metric-label">Past corrections</span><span class="metric-value {{ 'risk-high' if c.historical_median_depth_pct is not none and c.historical_median_depth_pct <= -25 else '' }}">{{ "%.0f%%"|format(c.historical_median_depth_pct) if c.historical_median_depth_pct is not none else "n/a" }}{% if c.historical_median_duration_days is not none %} <span class="muted">/ {{ c.historical_median_duration_days }}d typical</span>{% endif %}</span></div>
       </div>
 
       <div class="badges">
+        {% if c.ticker in recent_split_tickers %}
+          <span class="badge badge-info" title="Recent news mentions a stock split for this ticker - double-check the strike/premium economics still make sense">⚠ Recent stock-split news</span>
+        {% endif %}
         {% set sector_trend = sector_trend_by_name.get(c.sector) if c.sector else none %}
         {% if c.sector and sector_trend is not none %}
           <span class="badge {{ 'badge-sector-up' if sector_trend >= 0 else 'badge-sector-down' }}">
-            Sector: {{ c.sector }} ({{ "%+.2f"|format(sector_trend) }}% / {{ sector_lookback_days }}d)
+            Sector: {{ c.sector }}{% if c.industry %} · {{ c.industry }}{% endif %} ({{ "%+.2f"|format(sector_trend) }}% / {{ sector_lookback_days }}d)
           </span>
         {% elif c.sector %}
           <span class="badge badge-neutral">Sector: {{ c.sector }}</span>
@@ -248,14 +266,8 @@
       </details>
       {% endif %}
 
-      <div class="card-actions">
-        <button class="accept-btn" onclick="decideCandidate(this, 'cash_secured_put', 'accepted')"
-          data-run-id="{{ c.run_id }}" data-ticker="{{ c.ticker }}" data-expiry="{{ c.expiry }}" data-strike="{{ c.strike }}">Accept</button>
-        <button class="ignore-btn" onclick="decideCandidate(this, 'cash_secured_put', 'ignored')"
-          data-run-id="{{ c.run_id }}" data-ticker="{{ c.ticker }}" data-expiry="{{ c.expiry }}" data-strike="{{ c.strike }}">Ignore</button>
       </div>
-      </div>
-    </details>
+    </div>
     {% endfor %}
   </div>
   </details>
@@ -286,13 +298,20 @@
             <td>{{ h.expiry }}</td>
             <td>${{ "%.2f"|format(h.strike) }}</td>
             <td>${{ "%.0f"|format(h.premium_total) }}</td>
-            <td>${{ "%.2f"|format(h.expiry_close_price) if h.expiry_close_price is not none else "n/a" }}</td>
-            <td>{{ h.evaluated_at[:10] if h.evaluated_at else "n/a" }}</td>
-            <td class="{{ 'pulse-up' if h.return_pct is not none and h.return_pct >= 0 else 'pulse-down' if h.return_pct is not none else '' }}">{{ "%+.1f%%"|format(h.return_pct) if h.return_pct is not none else "n/a" }}</td>
+            <td class="cell-resolved-price">${{ "%.2f"|format(h.expiry_close_price) if h.expiry_close_price is not none else "n/a" }}</td>
+            <td class="cell-resolved-date">{{ h.evaluated_at[:10] if h.evaluated_at else "n/a" }}</td>
+            <td class="cell-return {{ 'pulse-up' if h.return_pct is not none and h.return_pct >= 0 else 'pulse-down' if h.return_pct is not none else 'pulse-up' if h.live_return_pct is not none and h.live_return_pct >= 0 else 'pulse-down' if h.live_return_pct is not none else '' }}{{ ' return-live-preview' if h.return_pct is none and h.live_return_pct is not none else '' }}"
+                {%- if h.return_pct is none and h.live_return_pct is not none %} title="Live estimate as of now, not locked in - the official return is only set once this is actually resolved."{% endif %}>{% if h.return_pct is not none %}{{ "%+.1f%%"|format(h.return_pct) }}{% elif h.live_return_pct is not none %}~{{ "%+.1f%%"|format(h.live_return_pct) }} (now){% else %}n/a{% endif %}</td>
             <td>{% if h.decision %}<span class="badge decision-{{ h.decision }}">{{ h.decision|title }}</span>{% else %}<span class="muted">-</span>{% endif %}</td>
-            <td>{% if h.outcome %}<span class="badge outcome-{{ h.outcome }}">{{ h.outcome|replace("_"," ")|title }}</span>{% else %}<span class="muted">Pending</span>{% endif %}</td>
-            <td><button class="history-delete-btn" title="Stop tracking and delete this row" onclick="deleteHistoryRow(this, 'cash_secured_put')"
-              data-run-id="{{ h.run_id }}" data-ticker="{{ h.ticker }}" data-expiry="{{ h.expiry }}" data-strike="{{ h.strike }}">✕</button></td>
+            <td class="cell-outcome">{% if h.outcome %}<span class="badge outcome-{{ h.outcome }}">{{ h.outcome|replace("_"," ")|title }}</span>{% else %}<span class="muted">Pending</span>{% endif %}</td>
+            <td>
+              <button class="history-delete-btn" title="Stop tracking and delete this row" onclick="deleteHistoryRow(this, 'cash_secured_put')"
+                data-run-id="{{ h.run_id }}" data-ticker="{{ h.ticker }}" data-expiry="{{ h.expiry }}" data-strike="{{ h.strike }}">✕</button>
+              {% if not h.outcome %}
+              <button class="refresh-outcome-btn" title="Check if this is resolvable now" onclick="refreshHistoryOutcome(this, 'cash_secured_put')"
+                data-run-id="{{ h.run_id }}" data-ticker="{{ h.ticker }}" data-expiry="{{ h.expiry }}" data-strike="{{ h.strike }}">⟳</button>
+              {% endif %}
+            </td>
           </tr>
           {% endfor %}
         </tbody>
@@ -319,8 +338,8 @@
     <summary>Recommendations ({{ dip_candidates|length }})</summary>
   <div class="dip-candidates">
     {% for c in dip_candidates %}
-    <details class="dip-card {{ 'top-pick' if c.rank == 1 else '' }}">
-      <summary class="dip-card-summary">
+    <div class="dip-card {{ 'top-pick' if c.rank == 1 else '' }}">
+      <div class="dip-card-summary">
         <span class="rank-badge-sm">#{{ c.rank }}</span>
         <span class="dip-card-ticker">{{ c.ticker }}</span>
         <span class="current-price">${{ "%.2f"|format(c.price) if c.price is not none else "n/a" }}</span>
@@ -330,7 +349,13 @@
         {% if c.earnings_before_horizon %}<span class="earnings-alert-badge" title="Earnings {{ c.earnings_date }}">⚠ Earnings {{ c.earnings_date }}</span>{% endif %}
         <span class="metric-value risk-{{ (c.risk_label or "")|lower }}">{{ c.risk_label }}</span>
         <span class="dip-card-score">{{ "%.3f"|format(c.composite_score) }}</span>
-      </summary>
+        <button class="refresh-price-btn" title="Refresh live price" onclick="refreshPrice(this, '{{ c.ticker }}')">⟳</button>
+        <button class="accept-icon-btn" title="Accept" onclick="decideCandidate(this, 'dip_buy', 'accepted')"
+          data-run-id="{{ c.run_id }}" data-ticker="{{ c.ticker }}" data-flagged-date="{{ c.flagged_date }}">✓</button>
+        <button class="ignore-icon-btn" title="Ignore" onclick="decideCandidate(this, 'dip_buy', 'ignored')"
+          data-run-id="{{ c.run_id }}" data-ticker="{{ c.ticker }}" data-flagged-date="{{ c.flagged_date }}">✕</button>
+        <button class="expand-toggle-btn" title="Show more details" onclick="toggleCardBody(this)">▸</button>
+      </div>
       <div class="dip-card-body">
         <div class="company-name">{{ c.company_name or "" }}</div>
         <div class="metrics-grid">
@@ -340,16 +365,22 @@
           <div class="metric"><span class="metric-label">Flagged</span><span class="metric-value">{{ c.flagged_date }}</span></div>
           <div class="metric"><span class="metric-label">P/E (trailing)</span><span class="metric-value">{{ "%.1f"|format(c.pe_ratio) if c.pe_ratio is not none else "n/a" }}</span></div>
           <div class="metric"><span class="metric-label">52wk range</span><span class="metric-value">{{ "${:.0f}".format(c.week52_low) if c.week52_low is not none else "n/a" }} - {{ "${:.0f}".format(c.week52_high) if c.week52_high is not none else "n/a" }}</span></div>
+          <div class="metric"><span class="metric-label">Debt/Equity</span><span class="metric-value {{ 'risk-high' if c.debt_to_equity is not none and c.debt_to_equity >= 200 else '' }}">{{ "%.0f%%"|format(c.debt_to_equity) if c.debt_to_equity is not none else "n/a" }}</span></div>
+          <div class="metric"><span class="metric-label">vs Market</span><span class="metric-value {{ 'risk-high' if c.relative_strength_pct is not none and c.relative_strength_pct <= -15 else '' }}">{{ "%+.1f%%"|format(c.relative_strength_pct) if c.relative_strength_pct is not none else "n/a" }} <span class="muted">vs SPY</span></span></div>
+          <div class="metric"><span class="metric-label">Dip history</span><span class="metric-value">{{ c.dip_maturity_label|title if c.dip_maturity_label and c.dip_maturity_label != 'unknown' else "n/a" }}{% if c.historical_median_depth_pct is not none %} <span class="muted">(typically {{ "%.0f%%"|format(c.historical_median_depth_pct) }} / {{ c.historical_median_duration_days }}d)</span>{% endif %}</span></div>
         </div>
 
         <div class="badges">
+          {% if c.ticker in recent_split_tickers %}
+            <span class="badge badge-info" title="Recent news mentions a stock split for this ticker">⚠ Recent stock-split news</span>
+          {% endif %}
           {% set sector_trend = sector_trend_by_name.get(c.sector) if c.sector else none %}
           {% if c.sector and sector_trend is not none %}
             <span class="badge {{ 'badge-sector-up' if sector_trend >= 0 else 'badge-sector-down' }}">
-              Sector: {{ c.sector }} ({{ "%+.2f"|format(sector_trend) }}% / {{ sector_lookback_days }}d)
+              Sector: {{ c.sector }}{% if c.industry %} · {{ c.industry }}{% endif %} ({{ "%+.2f"|format(sector_trend) }}% / {{ sector_lookback_days }}d)
             </span>
           {% elif c.sector %}
-            <span class="badge badge-neutral">Sector: {{ c.sector }}</span>
+            <span class="badge badge-neutral">Sector: {{ c.sector }}{% if c.industry %} · {{ c.industry }}{% endif %}</span>
           {% endif %}
           {% if c.analyst_recommendation %}
             <span class="badge badge-neutral">Analyst: {{ c.analyst_recommendation|replace("_"," ")|title }}{% if c.analyst_upside_pct is not none %} ({{ "%+.1f"|format(c.analyst_upside_pct) }}% upside){% endif %}</span>
@@ -359,14 +390,8 @@
           {% endif %}
         </div>
 
-        <div class="card-actions">
-          <button class="accept-btn" onclick="decideCandidate(this, 'dip_buy', 'accepted')"
-            data-run-id="{{ c.run_id }}" data-ticker="{{ c.ticker }}" data-flagged-date="{{ c.flagged_date }}">Accept</button>
-          <button class="ignore-btn" onclick="decideCandidate(this, 'dip_buy', 'ignored')"
-            data-run-id="{{ c.run_id }}" data-ticker="{{ c.ticker }}" data-flagged-date="{{ c.flagged_date }}">Ignore</button>
-        </div>
       </div>
-    </details>
+    </div>
     {% endfor %}
   </div>
   </details>
@@ -391,14 +416,21 @@
           <tr>
             <td>{{ h.ticker }}</td>
             <td>{{ h.flagged_date }}</td>
-            <td>{{ h.evaluated_at[:10] if h.evaluated_at else "n/a" }}</td>
+            <td class="cell-resolved-date">{{ h.evaluated_at[:10] if h.evaluated_at else "n/a" }}</td>
             <td>${{ "%.2f"|format(h.price) if h.price is not none else "n/a" }}</td>
-            <td>${{ "%.2f"|format(h.resolved_price) if h.resolved_price is not none else "n/a" }}</td>
-            <td class="{{ 'pulse-up' if h.return_pct is not none and h.return_pct >= 0 else 'pulse-down' if h.return_pct is not none else '' }}">{{ "%+.1f%%"|format(h.return_pct) if h.return_pct is not none else "n/a" }}</td>
+            <td class="cell-resolved-price">${{ "%.2f"|format(h.resolved_price) if h.resolved_price is not none else "n/a" }}</td>
+            <td class="cell-return {{ 'pulse-up' if h.return_pct is not none and h.return_pct >= 0 else 'pulse-down' if h.return_pct is not none else 'pulse-up' if h.live_return_pct is not none and h.live_return_pct >= 0 else 'pulse-down' if h.live_return_pct is not none else '' }}{{ ' return-live-preview' if h.return_pct is none and h.live_return_pct is not none else '' }}"
+                {%- if h.return_pct is none and h.live_return_pct is not none %} title="Live estimate as of now, not locked in - the official return is only set once this is actually resolved."{% endif %}>{% if h.return_pct is not none %}{{ "%+.1f%%"|format(h.return_pct) }}{% elif h.live_return_pct is not none %}~{{ "%+.1f%%"|format(h.live_return_pct) }} (now){% else %}n/a{% endif %}</td>
             <td>{% if h.decision %}<span class="badge decision-{{ h.decision }}">{{ h.decision|title }}</span>{% else %}<span class="muted">-</span>{% endif %}</td>
-            <td>{% if h.outcome %}<span class="badge outcome-{{ h.outcome }}">{{ h.outcome|replace("_"," ")|title }}</span>{% else %}<span class="muted">Pending</span>{% endif %}</td>
-            <td><button class="history-delete-btn" title="Stop tracking and delete this row" onclick="deleteHistoryRow(this, 'dip_buy')"
-              data-run-id="{{ h.run_id }}" data-ticker="{{ h.ticker }}" data-flagged-date="{{ h.flagged_date }}">✕</button></td>
+            <td class="cell-outcome">{% if h.outcome %}<span class="badge outcome-{{ h.outcome }}">{{ h.outcome|replace("_"," ")|title }}</span>{% else %}<span class="muted">Pending</span>{% endif %}</td>
+            <td>
+              <button class="history-delete-btn" title="Stop tracking and delete this row" onclick="deleteHistoryRow(this, 'dip_buy')"
+                data-run-id="{{ h.run_id }}" data-ticker="{{ h.ticker }}" data-flagged-date="{{ h.flagged_date }}">✕</button>
+              {% if not h.outcome %}
+              <button class="refresh-outcome-btn" title="Check if this is resolvable now" onclick="refreshHistoryOutcome(this, 'dip_buy')"
+                data-run-id="{{ h.run_id }}" data-ticker="{{ h.ticker }}" data-flagged-date="{{ h.flagged_date }}">⟳</button>
+              {% endif %}
+            </td>
           </tr>
           {% endfor %}
         </tbody>
@@ -425,8 +457,8 @@
     <summary>Recommendations ({{ three_day_candidates|length }})</summary>
   <div class="dip-candidates">
     {% for c in three_day_candidates %}
-    <details class="dip-card {{ 'top-pick' if c.rank == 1 else '' }}">
-      <summary class="dip-card-summary">
+    <div class="dip-card {{ 'top-pick' if c.rank == 1 else '' }}">
+      <div class="dip-card-summary">
         <span class="rank-badge-sm">#{{ c.rank }}</span>
         <span class="dip-card-ticker">{{ c.ticker }}</span>
         <span class="current-price">${{ "%.2f"|format(c.price) if c.price is not none else "n/a" }}</span>
@@ -436,7 +468,13 @@
         {% if c.earnings_before_horizon %}<span class="earnings-alert-badge" title="Earnings {{ c.next_earnings_date }}">⚠ Earnings {{ c.next_earnings_date }}</span>{% endif %}
         <span class="metric-value risk-{{ (c.risk_label or "")|lower }}">{{ c.risk_label }}</span>
         <span class="dip-card-score">{{ "%.3f"|format(c.composite_score) }}</span>
-      </summary>
+        <button class="refresh-price-btn" title="Refresh live price" onclick="refreshPrice(this, '{{ c.ticker }}')">⟳</button>
+        <button class="accept-icon-btn" title="Accept" onclick="decideCandidate(this, 'three_day_rule', 'accepted')"
+          data-run-id="{{ c.run_id }}" data-ticker="{{ c.ticker }}" data-flagged-date="{{ c.flagged_date }}">✓</button>
+        <button class="ignore-icon-btn" title="Ignore" onclick="decideCandidate(this, 'three_day_rule', 'ignored')"
+          data-run-id="{{ c.run_id }}" data-ticker="{{ c.ticker }}" data-flagged-date="{{ c.flagged_date }}">✕</button>
+        <button class="expand-toggle-btn" title="Show more details" onclick="toggleCardBody(this)">▸</button>
+      </div>
       <div class="dip-card-body">
         <div class="company-name">{{ c.company_name or "" }}</div>
         <div class="metrics-grid">
@@ -448,16 +486,22 @@
           <div class="metric"><span class="metric-label">Flagged</span><span class="metric-value">{{ c.flagged_date }}</span></div>
           <div class="metric"><span class="metric-label">P/E (trailing)</span><span class="metric-value">{{ "%.1f"|format(c.pe_ratio) if c.pe_ratio is not none else "n/a" }}</span></div>
           <div class="metric"><span class="metric-label">52wk range</span><span class="metric-value">{{ "${:.0f}".format(c.week52_low) if c.week52_low is not none else "n/a" }} - {{ "${:.0f}".format(c.week52_high) if c.week52_high is not none else "n/a" }}</span></div>
+          <div class="metric"><span class="metric-label">Debt/Equity</span><span class="metric-value {{ 'risk-high' if c.debt_to_equity is not none and c.debt_to_equity >= 200 else '' }}">{{ "%.0f%%"|format(c.debt_to_equity) if c.debt_to_equity is not none else "n/a" }}</span></div>
+          <div class="metric"><span class="metric-label">vs Market</span><span class="metric-value {{ 'risk-high' if c.relative_strength_pct is not none and c.relative_strength_pct <= -15 else '' }}">{{ "%+.1f%%"|format(c.relative_strength_pct) if c.relative_strength_pct is not none else "n/a" }} <span class="muted">vs SPY</span></span></div>
+          <div class="metric"><span class="metric-label">Dip history</span><span class="metric-value">{{ c.dip_maturity_label|title if c.dip_maturity_label and c.dip_maturity_label != 'unknown' else "n/a" }}{% if c.historical_median_depth_pct is not none %} <span class="muted">(typically {{ "%.0f%%"|format(c.historical_median_depth_pct) }} / {{ c.historical_median_duration_days }}d)</span>{% endif %}</span></div>
         </div>
 
         <div class="badges">
+          {% if c.ticker in recent_split_tickers %}
+            <span class="badge badge-info" title="Recent news mentions a stock split for this ticker">⚠ Recent stock-split news</span>
+          {% endif %}
           {% set sector_trend = sector_trend_by_name.get(c.sector) if c.sector else none %}
           {% if c.sector and sector_trend is not none %}
             <span class="badge {{ 'badge-sector-up' if sector_trend >= 0 else 'badge-sector-down' }}">
-              Sector: {{ c.sector }} ({{ "%+.2f"|format(sector_trend) }}% / {{ sector_lookback_days }}d)
+              Sector: {{ c.sector }}{% if c.industry %} · {{ c.industry }}{% endif %} ({{ "%+.2f"|format(sector_trend) }}% / {{ sector_lookback_days }}d)
             </span>
           {% elif c.sector %}
-            <span class="badge badge-neutral">Sector: {{ c.sector }}</span>
+            <span class="badge badge-neutral">Sector: {{ c.sector }}{% if c.industry %} · {{ c.industry }}{% endif %}</span>
           {% endif %}
           {% if c.analyst_recommendation %}
             <span class="badge badge-neutral">Analyst: {{ c.analyst_recommendation|replace("_"," ")|title }}{% if c.analyst_upside_pct is not none %} ({{ "%+.1f"|format(c.analyst_upside_pct) }}% upside){% endif %}</span>
@@ -467,14 +511,8 @@
           {% endif %}
         </div>
 
-        <div class="card-actions">
-          <button class="accept-btn" onclick="decideCandidate(this, 'three_day_rule', 'accepted')"
-            data-run-id="{{ c.run_id }}" data-ticker="{{ c.ticker }}" data-flagged-date="{{ c.flagged_date }}">Accept</button>
-          <button class="ignore-btn" onclick="decideCandidate(this, 'three_day_rule', 'ignored')"
-            data-run-id="{{ c.run_id }}" data-ticker="{{ c.ticker }}" data-flagged-date="{{ c.flagged_date }}">Ignore</button>
-        </div>
       </div>
-    </details>
+    </div>
     {% endfor %}
   </div>
   </details>
@@ -499,14 +537,21 @@
           <tr>
             <td>{{ h.ticker }}</td>
             <td>{{ h.flagged_date }}</td>
-            <td>{{ h.evaluated_at[:10] if h.evaluated_at else "n/a" }}</td>
+            <td class="cell-resolved-date">{{ h.evaluated_at[:10] if h.evaluated_at else "n/a" }}</td>
             <td>${{ "%.2f"|format(h.price) if h.price is not none else "n/a" }}</td>
-            <td>${{ "%.2f"|format(h.resolved_price) if h.resolved_price is not none else "n/a" }}</td>
-            <td class="{{ 'pulse-up' if h.return_pct is not none and h.return_pct >= 0 else 'pulse-down' if h.return_pct is not none else '' }}">{{ "%+.1f%%"|format(h.return_pct) if h.return_pct is not none else "n/a" }}</td>
+            <td class="cell-resolved-price">${{ "%.2f"|format(h.resolved_price) if h.resolved_price is not none else "n/a" }}</td>
+            <td class="cell-return {{ 'pulse-up' if h.return_pct is not none and h.return_pct >= 0 else 'pulse-down' if h.return_pct is not none else 'pulse-up' if h.live_return_pct is not none and h.live_return_pct >= 0 else 'pulse-down' if h.live_return_pct is not none else '' }}{{ ' return-live-preview' if h.return_pct is none and h.live_return_pct is not none else '' }}"
+                {%- if h.return_pct is none and h.live_return_pct is not none %} title="Live estimate as of now, not locked in - the official return is only set once this is actually resolved."{% endif %}>{% if h.return_pct is not none %}{{ "%+.1f%%"|format(h.return_pct) }}{% elif h.live_return_pct is not none %}~{{ "%+.1f%%"|format(h.live_return_pct) }} (now){% else %}n/a{% endif %}</td>
             <td>{% if h.decision %}<span class="badge decision-{{ h.decision }}">{{ h.decision|title }}</span>{% else %}<span class="muted">-</span>{% endif %}</td>
-            <td>{% if h.outcome %}<span class="badge outcome-{{ h.outcome }}">{{ h.outcome|replace("_"," ")|title }}</span>{% else %}<span class="muted">Pending</span>{% endif %}</td>
-            <td><button class="history-delete-btn" title="Stop tracking and delete this row" onclick="deleteHistoryRow(this, 'three_day_rule')"
-              data-run-id="{{ h.run_id }}" data-ticker="{{ h.ticker }}" data-flagged-date="{{ h.flagged_date }}">✕</button></td>
+            <td class="cell-outcome">{% if h.outcome %}<span class="badge outcome-{{ h.outcome }}">{{ h.outcome|replace("_"," ")|title }}</span>{% else %}<span class="muted">Pending</span>{% endif %}</td>
+            <td>
+              <button class="history-delete-btn" title="Stop tracking and delete this row" onclick="deleteHistoryRow(this, 'three_day_rule')"
+                data-run-id="{{ h.run_id }}" data-ticker="{{ h.ticker }}" data-flagged-date="{{ h.flagged_date }}">✕</button>
+              {% if not h.outcome %}
+              <button class="refresh-outcome-btn" title="Check if this is resolvable now" onclick="refreshHistoryOutcome(this, 'three_day_rule')"
+                data-run-id="{{ h.run_id }}" data-ticker="{{ h.ticker }}" data-flagged-date="{{ h.flagged_date }}">⟳</button>
+              {% endif %}
+            </td>
           </tr>
           {% endfor %}
         </tbody>
@@ -534,7 +579,7 @@ const EMPTY_STATE_TEXT = {
 };
 
 function decideCandidate(btn, strategy, decision) {
-  const card = btn.closest('details');
+  const card = btn.closest('.candidate-card, .dip-card');
   const container = card.parentElement;
   const listToggle = container.closest('.list-toggle');
   const fd = new FormData();
@@ -607,6 +652,101 @@ function deleteHistoryRow(btn, strategy) {
     });
 }
 
+function refreshHistoryOutcome(btn, strategy) {
+  const row = btn.closest('tr');
+  const fd = new FormData();
+  fd.append('strategy', strategy);
+  fd.append('run_id', btn.dataset.runId);
+  fd.append('ticker', btn.dataset.ticker);
+  if (btn.dataset.expiry) fd.append('expiry', btn.dataset.expiry);
+  if (btn.dataset.strike) fd.append('strike', btn.dataset.strike);
+  if (btn.dataset.flaggedDate) fd.append('flagged_date', btn.dataset.flaggedDate);
+  btn.disabled = true;
+  btn.classList.add('spinning');
+  fetch('/api/history/refresh', { method: 'POST', body: fd })
+    .then(r => r.json())
+    .then(data => {
+      btn.disabled = false;
+      btn.classList.remove('spinning');
+      if (data.error) {
+        alert(data.error);
+        return;
+      }
+      if (data.status === 'not_ready') {
+        btn.title = 'Not resolvable yet - no trading data for the resolution date. Showing a live, unlocked estimate.';
+        const returnCell = row.querySelector('.cell-return');
+        if (returnCell && data.live_return_pct != null) {
+          returnCell.textContent = '~' + (data.live_return_pct >= 0 ? '+' : '') + data.live_return_pct.toFixed(1) + '% (now)';
+          returnCell.classList.remove('pulse-up', 'pulse-down');
+          returnCell.classList.add(data.live_return_pct >= 0 ? 'pulse-up' : 'pulse-down');
+          returnCell.classList.add('return-live-preview');
+          returnCell.title = 'Live estimate as of now, not locked in - the official return is only set once this is actually resolved.';
+        }
+        return;
+      }
+      // 'resolved' (or 'already_resolved', if two tabs raced) - fill in
+      // whatever the server has now and retire the button either way.
+      const dateCell = row.querySelector('.cell-resolved-date');
+      if (dateCell && data.evaluated_at) dateCell.textContent = data.evaluated_at.slice(0, 10);
+      const priceCell = row.querySelector('.cell-resolved-price');
+      if (priceCell && data.resolved_price != null) priceCell.textContent = '$' + data.resolved_price.toFixed(2);
+      const returnCell = row.querySelector('.cell-return');
+      if (returnCell && data.return_pct != null) {
+        returnCell.textContent = (data.return_pct >= 0 ? '+' : '') + data.return_pct.toFixed(1) + '%';
+        returnCell.classList.remove('pulse-up', 'pulse-down', 'return-live-preview');
+        returnCell.classList.add(data.return_pct >= 0 ? 'pulse-up' : 'pulse-down');
+        returnCell.title = '';
+      }
+      const outcomeCell = row.querySelector('.cell-outcome');
+      if (outcomeCell && data.outcome) {
+        const label = data.outcome.replace(/_/g, ' ').replace(/\b\w/g, ch => ch.toUpperCase());
+        outcomeCell.innerHTML = '<span class="badge outcome-' + data.outcome + '">' + label + '</span>';
+      }
+      btn.remove();
+    })
+    .catch(() => {
+      btn.disabled = false;
+      btn.classList.remove('spinning');
+      alert('Failed to check outcome - try again.');
+    });
+}
+
+function refreshPrice(btn, ticker) {
+  const card = btn.closest('.candidate-card, .dip-card');
+  btn.disabled = true;
+  btn.classList.add('spinning');
+  const fd = new FormData();
+  fd.append('ticker', ticker);
+  fetch('/api/refresh-price', { method: 'POST', body: fd })
+    .then(r => r.json())
+    .then(data => {
+      btn.disabled = false;
+      btn.classList.remove('spinning');
+      if (data.error) {
+        alert(data.error);
+        return;
+      }
+      card.querySelectorAll('.current-price').forEach(el => {
+        el.textContent = '$' + data.price.toFixed(2);
+        el.classList.add('price-flash');
+        setTimeout(() => el.classList.remove('price-flash'), 800);
+      });
+    })
+    .catch(() => {
+      btn.disabled = false;
+      btn.classList.remove('spinning');
+      alert('Failed to refresh price - try again.');
+    });
+}
+
+function toggleCardBody(btn) {
+  const card = btn.closest('.candidate-card, .dip-card');
+  card.classList.toggle('card-expanded');
+  const expanded = card.classList.contains('card-expanded');
+  btn.textContent = expanded ? '▾' : '▸';
+  btn.title = expanded ? 'Hide details' : 'Show more details';
+}
+
 function startRefresh(strategy) {
   const status = document.getElementById('refresh-status-' + strategy);
   const fd = new FormData();
@@ -663,7 +803,16 @@ function pollStatus(strategy) {
         if (status) status.textContent = 'Failed: ' + refresh.last_error;
         return;
       }
-      window.location.reload();
+      // Carry the result across the reload (needed to pick up any new/
+      // changed cards) via a query param, so the page doesn't just go
+      // quiet - a 0-result run looks identical to nothing having
+      // happened at all otherwise. See the IIFE near the bottom of this
+      // script that reads it back and clears it from the URL.
+      const found = data.last_run ? data.last_run.candidates_found : null;
+      const url = new URL(window.location);
+      url.searchParams.set('generated', strategy);
+      if (found !== null && found !== undefined) url.searchParams.set('found', found);
+      window.location.href = url.toString();
     }
   });
 }
@@ -738,6 +887,14 @@ function updatePulse(data) {
       ? data.market_mood.benchmark + ' ' + (trendPct > 0 ? '+' : '') + trendPct.toFixed(2) +
         '% over last ' + data.market_mood.lookback_days + ' trading days'
       : '';
+    const drawdownPct = data.market_mood.drawdown_pct;
+    if (drawdownPct !== null && drawdownPct !== undefined && drawdownPct < 0) {
+      detail += ' (worst: ' + drawdownPct.toFixed(2) + '%)';
+    }
+    const rateTrendPct = data.market_mood.rate_trend_pct;
+    if (rateTrendPct !== null && rateTrendPct !== undefined && rateTrendPct <= -2.0) {
+      detail += ' · ' + data.market_mood.rate_benchmark + ' ' + rateTrendPct.toFixed(2) + '% (rates tightening - amplifies leveraged names\' risk)';
+    }
     const breadthPct = data.market_mood.live_breadth_pct;
     if (breadthPct !== null && breadthPct !== undefined) {
       detail += (detail ? ' · ' : '') + 'live breadth ' + (breadthPct > 0 ? '+' : '') + breadthPct.toFixed(2) + '%';
@@ -811,6 +968,30 @@ function fetchPulse() {
 
 fetchPulse();
 setInterval(fetchPulse, {{ market_pulse_refresh_seconds }} * 1000);
+
+// Shows the just-completed Generate's result (see pollStatus) once, right
+// after the reload it triggers - a 0-candidate run otherwise looks exactly
+// like clicking Generate did nothing at all. Then strips the query params
+// so a later manual page reload doesn't keep re-showing stale news.
+(function showGenerateResult() {
+  const params = new URLSearchParams(window.location.search);
+  const strategy = params.get('generated');
+  if (strategy) {
+    const found = params.get('found');
+    const status = document.getElementById('refresh-status-' + strategy);
+    if (status) {
+      status.textContent = (!found || found === '0')
+        ? 'No new recommendations found.'
+        : 'Found ' + found + ' new recommendation' + (found === '1' ? '' : 's') + '.';
+      status.classList.add('generate-result-flash');
+      setTimeout(() => status.classList.remove('generate-result-flash'), 4000);
+    }
+    params.delete('generated');
+    params.delete('found');
+    const qs = params.toString();
+    window.history.replaceState({}, '', window.location.pathname + (qs ? '?' + qs : ''));
+  }
+})();
 </script>
 </body>
 </html>

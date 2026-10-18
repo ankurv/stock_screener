@@ -30,6 +30,10 @@ from common import get_logger, http_get
 log = get_logger("news_rss")
 
 GOOGLE_NEWS_RSS_URL = "https://news.google.com/rss/search"
+# Reserved "ticker" for broad market-wide news (see refresh_market_news) -
+# reuses the same news_item archive/dedup-by-link machinery as per-ticker
+# news instead of a separate, non-accumulating cache.
+MARKET_NEWS_KEY = "__market__"
 
 
 def _classify(title: str, cfg: dict) -> str:
@@ -116,19 +120,27 @@ def fetch_market_news(cfg: dict, limit: int = 8) -> list[dict]:
     return _fetch_rss_items(query_text, cfg, limit)
 
 
-def refresh_market_news(db, cfg: dict) -> list[dict]:
-    """Refresh the cached market-mood news if stale; always returns the current (possibly cached) list."""
+def refresh_market_news(db, cfg: dict, display_limit: int = 8) -> list[dict]:
+    """
+    Refreshes the cached market-mood news if stale; always returns the
+    current (possibly cached) list. Accumulates into the same news_item
+    archive used for per-ticker news (under the reserved MARKET_NEWS_KEY)
+    instead of replacing the list outright on every refresh - a headline
+    that scrolls out of Google's current top results is still kept around
+    locally rather than being discarded the moment this next runs. Only
+    the fetch itself is TTL-gated; reading back out is always free.
+    """
     ttl = cfg["cache_ttl_minutes"].get("market_news", 60)
-    cached = db.get_market_news(ttl_minutes=ttl)
-    if cached is not None:
-        return cached
-    try:
-        items = fetch_market_news(cfg)
-    except Exception as exc:  # noqa: BLE001
-        log.warning("Market news fetch failed: %s", exc)
-        return db.get_market_news() or []
-    db.set_market_news(items)
-    return items
+    age = db.news_fetch_age_minutes(MARKET_NEWS_KEY)
+    if age is None or age > ttl:
+        try:
+            items = fetch_market_news(cfg)
+        except Exception as exc:  # noqa: BLE001
+            log.warning("Market news fetch failed: %s", exc)
+            items = None
+        if items:
+            db.upsert_news(MARKET_NEWS_KEY, items)
+    return db.get_news(MARKET_NEWS_KEY, limit=display_limit)
 
 
 def refresh_news_for_universe(
@@ -136,7 +148,7 @@ def refresh_news_for_universe(
 ) -> dict:
     """Concurrent (no stated rate-limit guideline for Google News RSS, unlike SEC EDGAR) - same pattern as market_data."""
     ttl = cfg["cache_ttl_minutes"]["news"]
-    summary = {"updated": 0, "skipped_fresh": 0, "errors": []}
+    summary = {"updated": 0, "skipped_fresh": 0, "new_articles": 0, "errors": []}
 
     to_fetch = []
     for row in universe:
@@ -147,10 +159,16 @@ def refresh_news_for_universe(
             continue
         to_fetch.append(row)
 
-    def _fetch_one(row: dict):
+    def _fetch_one(row: dict) -> int:
+        """Returns how many of this fetch's items weren't already cached - the archive only ever grows, never replaces."""
         items = fetch_news_for_ticker(row["ticker"], row.get("company_name"), cfg)
-        if items:
-            db.upsert_news(row["ticker"], items)
+        if not items:
+            return 0
+        known_links = db.get_cached_news_links(row["ticker"])
+        new_items = [i for i in items if i["link"] not in known_links]
+        if new_items:
+            db.upsert_news(row["ticker"], new_items)
+        return len(new_items)
 
     total = len(to_fetch)
     completed = 0
@@ -161,7 +179,7 @@ def refresh_news_for_universe(
             ticker = future_to_ticker[future]
             completed += 1
             try:
-                future.result()
+                summary["new_articles"] += future.result()
                 summary["updated"] += 1
             except Exception as exc:  # noqa: BLE001
                 log.warning("News fetch failed for %s: %s", ticker, exc)

@@ -27,6 +27,9 @@ from engine.signals import (
     market_mood_risk_component,
     technical_risk_component,
     analyst_sentiment_score,
+    leverage_risk_component,
+    relative_weakness_risk_component,
+    historical_drawdown_risk_component,
 )
 
 
@@ -67,6 +70,9 @@ def _risk_score(
     market_mood_component: float = 0.0,
     technical_component: float = 0.0,
     strike_distance_component: float = 0.0,
+    leverage_component: float = 0.0,
+    relative_weakness_component: float = 0.0,
+    historical_drawdown_component: float = 0.0,
 ) -> tuple[int, str]:
     """
     1 (least risky) to 10 (most risky) read on how risky the *underlying/
@@ -79,7 +85,15 @@ def _risk_score(
     far the strike sits from the current price (see
     strike_distance_risk_component) a close second - a near-the-money strike
     on an otherwise "safe" stock is still a real assignment risk.
-    coverage/earnings-gap/spread/market-mood/technicals are secondary.
+    coverage/earnings-gap/spread/market-mood/technicals/leverage/relative-
+    weakness/historical-drawdown are secondary - a cash-secured put should
+    be sold on names you're fine holding if assigned, so a stock that's
+    chronically underperforming the market (see engine.signals.
+    relative_weakness_risk_component) or has a history of deep, long
+    corrections (historical_drawdown_risk_component) is a worse pick here
+    even if its *current* contract terms look attractive, on top of
+    leverage - the fundamental/relative-performance signals, instead of
+    everything being price-and-technicals-only.
     """
     iv = implied_vol or 0.0
     iv_component = min(iv / 1.5, 1.0)  # ~150%+ annualized IV treated as max risk
@@ -88,13 +102,16 @@ def _risk_score(
     spread_component = 0.0 if spread_pct is None else min(spread_pct / max_spread_pct, 1.0)
 
     raw = (
-        0.35 * iv_component
-        + 0.20 * strike_distance_component
-        + 0.10 * coverage_component
-        + 0.10 * earnings_component
-        + 0.05 * spread_component
-        + 0.10 * market_mood_component
-        + 0.10 * technical_component
+        0.25 * iv_component
+        + 0.15 * strike_distance_component
+        + 0.06 * coverage_component
+        + 0.06 * earnings_component
+        + 0.03 * spread_component
+        + 0.08 * market_mood_component
+        + 0.08 * technical_component
+        + 0.12 * leverage_component
+        + 0.09 * relative_weakness_component
+        + 0.08 * historical_drawdown_component
     )
     score = max(1, min(10, round(1 + raw * 9)))
     label = "Low" if score <= 3 else "Medium" if score <= 6 else "High"
@@ -114,6 +131,8 @@ def evaluate_candidates(
     market_mood: Optional[dict] = None,
     technicals: Optional[dict] = None,
     sector: Optional[str] = None,
+    relative_strength_pct: Optional[float] = None,
+    historical_drawdown_stats: Optional[dict] = None,
 ) -> list[dict]:
     """
     Apply hard filters (min yield, min OI, max spread) and compute a
@@ -121,6 +140,15 @@ def evaluate_candidates(
     one dict per surviving contract (ticker can have 0+ rows). No capital/
     collateral cap here - this is a ranked watchlist (see
     select_top_candidates); size each position's collateral yourself.
+
+    relative_strength_pct and historical_drawdown_stats are fetched by the
+    caller (see engine.strategies.cash_secured_put.generate - this
+    function stays I/O-free) via the same shared price-history cache
+    dip_buy/three_day_rule already use for the identical signals - a
+    cash-secured put should be sold on names you're fine holding if
+    assigned, so a stock that's chronically weak vs. the market or has a
+    history of deep/long corrections is a worse pick even when its
+    current contract terms look attractive.
     """
     today = today or date.today()
     if not price or price <= 0 or not put_rows:
@@ -134,6 +162,14 @@ def evaluate_candidates(
     anomaly_type = (earnings_reaction or {}).get("anomaly_type")
     mood_component = market_mood_risk_component((market_mood or {}).get("trend_pct"))
     tech_component = technical_risk_component(technicals)
+    leverage_component = leverage_risk_component(
+        (analyst_snapshot or {}).get("debt_to_equity"), (market_mood or {}).get("rate_trend_pct")
+    )
+    relative_weakness_component = relative_weakness_risk_component(relative_strength_pct)
+    historical_drawdown_component = historical_drawdown_risk_component(
+        (historical_drawdown_stats or {}).get("median_depth_pct"),
+        (historical_drawdown_stats or {}).get("median_duration_days"),
+    )
     is_beat_but_sold_off = anomaly_type == "beat_but_sold_off"
 
     for row in put_rows:
@@ -229,6 +265,9 @@ def evaluate_candidates(
             market_mood_component=mood_component,
             technical_component=tech_component,
             strike_distance_component=strike_distance_risk_component(price, strike),
+            leverage_component=leverage_component,
+            relative_weakness_component=relative_weakness_component,
+            historical_drawdown_component=historical_drawdown_component,
         )
 
         results.append(
@@ -260,6 +299,11 @@ def evaluate_candidates(
                 "pe_ratio": (analyst_snapshot or {}).get("pe_ratio"),
                 "week52_low": (analyst_snapshot or {}).get("week52_low"),
                 "week52_high": (analyst_snapshot or {}).get("week52_high"),
+                "debt_to_equity": (analyst_snapshot or {}).get("debt_to_equity"),
+                "industry": (analyst_snapshot or {}).get("industry"),
+                "relative_strength_pct": round(relative_strength_pct, 2) if relative_strength_pct is not None else None,
+                "historical_median_depth_pct": (historical_drawdown_stats or {}).get("median_depth_pct"),
+                "historical_median_duration_days": (historical_drawdown_stats or {}).get("median_duration_days"),
                 "earnings_anomaly_type": anomaly_type,
                 "composite_score": round(composite, 4),
                 "risk_score": risk_score,
@@ -292,16 +336,27 @@ def diversify_by_sector(ranked_candidates: list[dict], top_n: int, max_per_secto
     min_composite_score elsewhere here: returning less than asked for is
     the correct behavior when there isn't enough of what you actually want,
     not something to paper over.
+
+    Grouped by (sector, industry) when the finer-grained GICS sub-industry
+    is known, not sector alone - a broad sector like "Information
+    Technology" actually spans very different businesses (chipmakers,
+    software, hardware), so capping on sector alone wrongly treats a
+    semiconductor name and a software name as "the same risk" and starves
+    the result down to a handful of names. Falls back to sector alone when
+    industry isn't available (ETFs, custom watchlist tickers without real
+    GICS data) - see data_sources.market_data.fetch_analyst_snapshot.
     """
-    sector_counts: dict[str, int] = {}
+    sector_counts: dict = {}
     picked: list[dict] = []
     for c in ranked_candidates:
         sector = c.get("sector")
-        if sector and sector_counts.get(sector, 0) >= max_per_sector:
+        industry = c.get("industry")
+        key = (sector, industry) if industry else sector
+        if key and sector_counts.get(key, 0) >= max_per_sector:
             continue
         picked.append(c)
-        if sector:
-            sector_counts[sector] = sector_counts.get(sector, 0) + 1
+        if key:
+            sector_counts[key] = sector_counts.get(key, 0) + 1
         if len(picked) >= top_n:
             break
     return picked

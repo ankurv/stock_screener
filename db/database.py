@@ -50,9 +50,44 @@ class Database:
         finally:
             c.close()
 
+    # Columns added after this DB file may already exist, in a tables-with-data
+    # upgrade path (ALTER TABLE ... ADD COLUMN) instead of the usual "delete
+    # data/screener.db and let schema.sql recreate it fresh" - the user asked
+    # that accumulated candidates/history/price_history never be wiped just
+    # for a schema change. Each entry is (table, column, sqlite type).
+    _LIGHT_MIGRATIONS = [
+        ("analyst_snapshot", "debt_to_equity", "REAL"),
+        ("put_candidate", "debt_to_equity", "REAL"),
+        ("dip_candidate", "debt_to_equity", "REAL"),
+        ("three_day_candidate", "debt_to_equity", "REAL"),
+        ("put_candidate", "relative_strength_pct", "REAL"),
+        ("put_candidate", "historical_median_depth_pct", "REAL"),
+        ("put_candidate", "historical_median_duration_days", "INTEGER"),
+        ("dip_candidate", "relative_strength_pct", "REAL"),
+        ("dip_candidate", "historical_median_depth_pct", "REAL"),
+        ("dip_candidate", "historical_median_duration_days", "INTEGER"),
+        ("dip_candidate", "dip_maturity_score", "REAL"),
+        ("dip_candidate", "dip_maturity_label", "TEXT"),
+        ("three_day_candidate", "relative_strength_pct", "REAL"),
+        ("three_day_candidate", "historical_median_depth_pct", "REAL"),
+        ("three_day_candidate", "historical_median_duration_days", "INTEGER"),
+        ("three_day_candidate", "dip_maturity_score", "REAL"),
+        ("three_day_candidate", "dip_maturity_label", "TEXT"),
+        ("analyst_snapshot", "industry", "TEXT"),
+        ("put_candidate", "industry", "TEXT"),
+        ("dip_candidate", "industry", "TEXT"),
+        ("three_day_candidate", "industry", "TEXT"),
+    ]
+
     def _init_schema(self):
         with self.conn() as c:
             c.executescript(SCHEMA_PATH.read_text())
+            for table, column, sqltype in self._LIGHT_MIGRATIONS:
+                try:
+                    c.execute(f"ALTER TABLE {table} ADD COLUMN {column} {sqltype}")
+                except sqlite3.OperationalError as exc:
+                    if "duplicate column name" not in str(exc):
+                        raise
 
     # ------------------------------------------------------------------
     # Generic fetch-cache (for anything not worth its own table)
@@ -90,11 +125,6 @@ class Database:
     def set_market_mood(self, data: dict):
         self.cache_set("market_mood", data)
 
-    def get_market_news(self, ttl_minutes: Optional[float] = None) -> Optional[list]:
-        return self.cache_get("market_news", ttl_minutes=ttl_minutes)
-
-    def set_market_news(self, items: list[dict]):
-        self.cache_set("market_news", items)
 
     def get_sector_performance(self, ttl_minutes: Optional[float] = None) -> Optional[list]:
         return self.cache_get("sector_performance", ttl_minutes=ttl_minutes)
@@ -231,23 +261,26 @@ class Database:
     # ------------------------------------------------------------------
     # Analyst consensus snapshot
     # ------------------------------------------------------------------
+    # Named params (not positional `?`) specifically so adding a new field
+    # here is a one-place change (this list) instead of three places kept
+    # in sync by hand - the exact way this broke before (a column added to
+    # the column list and VALUES but not the ON CONFLICT clause, so it
+    # silently never updated on upsert).
+    _ANALYST_SNAPSHOT_COLUMNS = [
+        "recommendation_key", "recommendation_mean", "num_analysts", "target_mean_price",
+        "target_high_price", "target_low_price", "pe_ratio", "week52_low", "week52_high", "debt_to_equity",
+        "industry",
+    ]
+
     def upsert_analyst_snapshot(self, ticker: str, snap: dict):
+        cols = self._ANALYST_SNAPSHOT_COLUMNS
         with self.conn() as c:
             c.execute(
-                "INSERT INTO analyst_snapshot (ticker, recommendation_key, recommendation_mean, num_analysts, "
-                "target_mean_price, target_high_price, target_low_price, pe_ratio, week52_low, week52_high, updated_at) "
-                "VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?) "
-                "ON CONFLICT(ticker) DO UPDATE SET recommendation_key=excluded.recommendation_key, "
-                "recommendation_mean=excluded.recommendation_mean, num_analysts=excluded.num_analysts, "
-                "target_mean_price=excluded.target_mean_price, target_high_price=excluded.target_high_price, "
-                "target_low_price=excluded.target_low_price, pe_ratio=excluded.pe_ratio, "
-                "week52_low=excluded.week52_low, week52_high=excluded.week52_high, updated_at=excluded.updated_at",
-                (
-                    ticker, snap.get("recommendation_key"), snap.get("recommendation_mean"),
-                    snap.get("num_analysts"), snap.get("target_mean_price"), snap.get("target_high_price"),
-                    snap.get("target_low_price"), snap.get("pe_ratio"), snap.get("week52_low"),
-                    snap.get("week52_high"), utcnow_iso(),
-                ),
+                f"INSERT INTO analyst_snapshot (ticker, {', '.join(cols)}, updated_at) "
+                f"VALUES (:ticker, {', '.join(':' + col for col in cols)}, :updated_at) "
+                f"ON CONFLICT(ticker) DO UPDATE SET {', '.join(f'{col}=excluded.{col}' for col in cols)}, "
+                f"updated_at=excluded.updated_at",
+                {"ticker": ticker, "updated_at": utcnow_iso(), **{col: snap.get(col) for col in cols}},
             )
 
     def get_analyst_snapshot(self, ticker: str, ttl_minutes: Optional[float] = None) -> Optional[dict]:
@@ -442,6 +475,12 @@ class Database:
             row = c.execute("SELECT MAX(updated_at) AS u FROM news_item WHERE ticker = ?", (ticker,)).fetchone()
         return _minutes_old(row["u"]) if row and row["u"] else None
 
+    def get_cached_news_links(self, ticker: str) -> set[str]:
+        """Every link already archived for this ticker - lets a fresh fetch tell new items from ones already seen."""
+        with self.conn() as c:
+            rows = c.execute("SELECT link FROM news_item WHERE ticker = ?", (ticker,)).fetchall()
+        return {r["link"] for r in rows}
+
     # ------------------------------------------------------------------
     # Pipeline runs + final candidates
     # ------------------------------------------------------------------
@@ -519,12 +558,14 @@ class Database:
                 "INSERT INTO put_candidate (run_id, ticker, company_name, price, sector, first_seen_at, expiry, strike, "
                 "bid, ask, mid_price, collateral, premium_total, annualized_yield_pct, prob_otm_pct, delta, open_interest, "
                 "spread_pct, days_to_expiry, earnings_before_expiry, analyst_recommendation, analyst_target_mean_price, "
-                "pe_ratio, week52_low, week52_high, "
+                "pe_ratio, week52_low, week52_high, debt_to_equity, industry, "
+                "relative_strength_pct, historical_median_depth_pct, historical_median_duration_days, "
                 "earnings_anomaly_type, composite_score, risk_score, risk_label, rsi_14, trend, macd_bullish, rank) VALUES "
                 "(:run_id, :ticker, :company_name, :price, :sector, :first_seen_at, :expiry, :strike, :bid, :ask, "
                 ":mid_price, :collateral, :premium_total, :annualized_yield_pct, :prob_otm_pct, :delta, :open_interest, "
                 ":spread_pct, :days_to_expiry, :earnings_before_expiry, :analyst_recommendation, :analyst_target_mean_price, "
-                ":pe_ratio, :week52_low, :week52_high, "
+                ":pe_ratio, :week52_low, :week52_high, :debt_to_equity, :industry, "
+                ":relative_strength_pct, :historical_median_depth_pct, :historical_median_duration_days, "
                 ":earnings_anomaly_type, :composite_score, :risk_score, :risk_label, :rsi_14, :trend, :macd_bullish, :rank)",
                 [{**cand, "run_id": run_id} for cand in candidates],
             )
@@ -556,6 +597,10 @@ class Database:
                 "SELECT * FROM put_candidate WHERE outcome IS NULL AND expiry <= ? ORDER BY expiry", (as_of,)
             ).fetchall()
         return [dict(r) for r in rows]
+
+    def get_candidate_row(self, run_id: int, ticker: str, expiry: str, strike: float) -> Optional[dict]:
+        """One exact put_candidate row - see _get_row."""
+        return self._get_row("put_candidate", run_id, ticker, "expiry=? AND strike=?", (expiry, strike))
 
     def record_recommendation_outcome(
         self, run_id: int, ticker: str, expiry: str, strike: float, outcome: str,
@@ -678,6 +723,22 @@ class Database:
             r["rank"] = i
         return results
 
+    def _get_row(self, table: str, run_id: int, ticker: str, extra_where: str = "", params: tuple = ()) -> Optional[dict]:
+        """
+        One exact row by its natural key - used by the track record's
+        manual "check now" refresh button to re-fetch a row's full data
+        (every column, not just the identifying key) before handing it to
+        a strategy's resolve_outcome/record_outcome, regardless of its
+        current decision/outcome state (unlike _active_rows above, which
+        deliberately excludes anything already decided or resolved).
+        """
+        query = f"SELECT * FROM {table} WHERE run_id=? AND ticker=?"
+        if extra_where:
+            query += f" AND {extra_where}"
+        with self.conn() as c:
+            row = c.execute(query, (run_id, ticker, *params)).fetchone()
+        return dict(row) if row else None
+
     def get_recent_decided_tickers(self, table: str, cutoff_iso: str) -> set[str]:
         """Tickers decided (accepted/ignored) on/after cutoff_iso in `table` - used to keep a cooldown from re-surfacing them."""
         with self.conn() as c:
@@ -695,7 +756,10 @@ class Database:
     _DIP_CANDIDATE_COLUMNS = [
         "run_id", "ticker", "company_name", "price", "sector", "flagged_date",
         "drawdown_pct", "drawdown_lookback_days", "rsi_14", "analyst_recommendation",
-        "analyst_target_mean_price", "analyst_upside_pct", "pe_ratio", "week52_low", "week52_high",
+        "analyst_target_mean_price", "analyst_upside_pct", "pe_ratio", "week52_low", "week52_high", "debt_to_equity",
+        "industry",
+        "relative_strength_pct", "historical_median_depth_pct", "historical_median_duration_days",
+        "dip_maturity_score", "dip_maturity_label",
         "earnings_date", "earnings_before_horizon",
         "composite_score", "risk_score", "risk_label", "rank",
     ]
@@ -717,6 +781,10 @@ class Database:
                 "SELECT * FROM dip_candidate WHERE outcome IS NULL AND flagged_date <= ? ORDER BY flagged_date", (as_of,)
             ).fetchall()
         return [dict(r) for r in rows]
+
+    def get_dip_candidate_row(self, run_id: int, ticker: str, flagged_date: str) -> Optional[dict]:
+        """One exact dip_candidate row - see _get_row."""
+        return self._get_row("dip_candidate", run_id, ticker, "flagged_date=?", (flagged_date,))
 
     def record_dip_outcome(
         self, run_id: int, ticker: str, flagged_date: str, outcome: str,
@@ -763,7 +831,10 @@ class Database:
         "last_earnings_date", "days_since_earnings", "window_start_date", "window_end_date",
         "anchor_close", "window_last_close", "drawdown_pct", "down_day_count", "surprise_pct",
         "rsi_14", "analyst_recommendation", "analyst_target_mean_price", "analyst_upside_pct",
-        "pe_ratio", "week52_low", "week52_high",
+        "pe_ratio", "week52_low", "week52_high", "debt_to_equity",
+        "industry",
+        "relative_strength_pct", "historical_median_depth_pct", "historical_median_duration_days",
+        "dip_maturity_score", "dip_maturity_label",
         "next_earnings_date", "earnings_before_horizon",
         "composite_score", "risk_score", "risk_label", "rank",
     ]
@@ -785,6 +856,10 @@ class Database:
                 "SELECT * FROM three_day_candidate WHERE outcome IS NULL AND flagged_date <= ? ORDER BY flagged_date", (as_of,)
             ).fetchall()
         return [dict(r) for r in rows]
+
+    def get_three_day_candidate_row(self, run_id: int, ticker: str, flagged_date: str) -> Optional[dict]:
+        """One exact three_day_candidate row - see _get_row."""
+        return self._get_row("three_day_candidate", run_id, ticker, "flagged_date=?", (flagged_date,))
 
     def record_three_day_outcome(
         self, run_id: int, ticker: str, flagged_date: str, outcome: str,
