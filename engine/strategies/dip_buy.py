@@ -212,6 +212,7 @@ def generate(db, cfg: dict, universe: list[dict]) -> list[dict]:
                 "price": round(price, 2),
                 "sector": row.get("sector"),
                 "flagged_date": flagged_date,
+                "price_captured_at": db.get_price_captured_at(ticker),
                 "drawdown_pct": round(drawdown_pct, 2),
                 "drawdown_lookback_days": lookback_days,
                 "rsi_14": round(rsi, 2),

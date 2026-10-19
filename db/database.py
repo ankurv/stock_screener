@@ -77,6 +77,9 @@ class Database:
         ("put_candidate", "industry", "TEXT"),
         ("dip_candidate", "industry", "TEXT"),
         ("three_day_candidate", "industry", "TEXT"),
+        ("put_candidate", "price_captured_at", "TEXT"),
+        ("dip_candidate", "price_captured_at", "TEXT"),
+        ("three_day_candidate", "price_captured_at", "TEXT"),
     ]
 
     def _init_schema(self):
@@ -236,6 +239,18 @@ class Database:
         if ttl_minutes is not None and _minutes_old(row["updated_at"]) > ttl_minutes:
             return None
         return row["last_price"]
+
+    def get_price_captured_at(self, ticker: str) -> Optional[str]:
+        """
+        Full ISO8601 UTC timestamp of when price_snapshot's cached quote for
+        this ticker was actually fetched - the true "as of" moment behind
+        whatever get_price(ticker) just returned, for strategies to stamp
+        onto a freshly-flagged candidate's price_captured_at (see
+        db.save_candidates / db._save_rows's carry-forward of the same).
+        """
+        with self.conn() as c:
+            row = c.execute("SELECT updated_at FROM price_snapshot WHERE ticker = ?", (ticker,)).fetchone()
+        return row["updated_at"] if row else None
 
     # ------------------------------------------------------------------
     # Earnings
@@ -524,22 +539,30 @@ class Database:
         candidates = list(candidates)
         with self.conn() as c:
             tickers = list({cand["ticker"] for cand in candidates})
-            # Carry forward first_seen_at from any pending copy this run
-            # supersedes - a ticker that's been pending for a few runs in a
-            # row should keep its ORIGINAL "first flagged" date, not reset
-            # to today every time a fresh scan re-surfaces it.
+            # Carry forward first_seen_at - AND the underlying price as of
+            # that first-seen date - from any pending copy this run
+            # supersedes. A ticker that's been pending for a few runs in a
+            # row should keep its ORIGINAL "first flagged" date and entry
+            # price, not reset either to today's every time a fresh scan
+            # re-surfaces it (price especially: it's documented elsewhere as
+            # needing to "stay fixed for return_pct to be computed correctly
+            # once resolved" - silently drifting it forward on every
+            # regeneration broke that invariant).
             first_seen_by_ticker: dict[str, str] = {}
+            entry_price_by_ticker: dict[str, float] = {}
+            price_captured_at_by_ticker: dict[str, Optional[str]] = {}
             if tickers:
                 existing = c.execute(
-                    f"SELECT ticker, first_seen_at FROM put_candidate WHERE decision IS NULL AND outcome IS NULL "
+                    f"SELECT ticker, first_seen_at, price, price_captured_at FROM put_candidate WHERE decision IS NULL AND outcome IS NULL "
                     f"AND ticker IN ({', '.join('?' * len(tickers))})",
                     tickers,
                 ).fetchall()
                 for row in existing:
-                    if row["first_seen_at"]:
-                        first_seen_by_ticker[row["ticker"]] = min(
-                            first_seen_by_ticker.get(row["ticker"], row["first_seen_at"]), row["first_seen_at"]
-                        )
+                    ticker = row["ticker"]
+                    if row["first_seen_at"] and (ticker not in first_seen_by_ticker or row["first_seen_at"] < first_seen_by_ticker[ticker]):
+                        first_seen_by_ticker[ticker] = row["first_seen_at"]
+                        entry_price_by_ticker[ticker] = row["price"]
+                        price_captured_at_by_ticker[ticker] = row["price_captured_at"]
                 # A ticker that was already pending from an earlier run (never
                 # decided, never resolved) is superseded the moment a fresh scan
                 # re-surfaces it - delete that stale copy, so it doesn't
@@ -554,14 +577,17 @@ class Database:
             for cand in candidates:
                 if cand["ticker"] in first_seen_by_ticker:
                     cand["first_seen_at"] = first_seen_by_ticker[cand["ticker"]]
+                    if entry_price_by_ticker.get(cand["ticker"]) is not None:
+                        cand["price"] = entry_price_by_ticker[cand["ticker"]]
+                    cand["price_captured_at"] = price_captured_at_by_ticker.get(cand["ticker"])
             c.executemany(
-                "INSERT INTO put_candidate (run_id, ticker, company_name, price, sector, first_seen_at, expiry, strike, "
+                "INSERT INTO put_candidate (run_id, ticker, company_name, price, sector, first_seen_at, price_captured_at, expiry, strike, "
                 "bid, ask, mid_price, collateral, premium_total, annualized_yield_pct, prob_otm_pct, delta, open_interest, "
                 "spread_pct, days_to_expiry, earnings_before_expiry, analyst_recommendation, analyst_target_mean_price, "
                 "pe_ratio, week52_low, week52_high, debt_to_equity, industry, "
                 "relative_strength_pct, historical_median_depth_pct, historical_median_duration_days, "
                 "earnings_anomaly_type, composite_score, risk_score, risk_label, rsi_14, trend, macd_bullish, rank) VALUES "
-                "(:run_id, :ticker, :company_name, :price, :sector, :first_seen_at, :expiry, :strike, :bid, :ask, "
+                "(:run_id, :ticker, :company_name, :price, :sector, :first_seen_at, :price_captured_at, :expiry, :strike, :bid, :ask, "
                 ":mid_price, :collateral, :premium_total, :annualized_yield_pct, :prob_otm_pct, :delta, :open_interest, "
                 ":spread_pct, :days_to_expiry, :earnings_before_expiry, :analyst_recommendation, :analyst_target_mean_price, "
                 ":pe_ratio, :week52_low, :week52_high, :debt_to_equity, :industry, "
@@ -655,17 +681,29 @@ class Database:
             # steps - same reasoning applies to every per-strategy candidate
             # table. date_col names whichever column is this table's "first
             # seen" tracking-start date (e.g. dip_candidate's flagged_date).
-            carried: dict[str, str] = {}
+            # `price` (and the exact timestamp it was captured at) is carried
+            # forward right alongside it, for the same reason: it's the
+            # entry price AT that first-seen date, and must stay fixed for
+            # return_pct to mean anything once resolved - a still-pending
+            # ticker that keeps re-qualifying on later runs should never have
+            # its "entry" quietly drift forward to whatever the stock
+            # happens to cost on the day it's re-surfaced.
+            carried_date: dict[str, str] = {}
+            carried_price: dict[str, float] = {}
+            carried_captured_at: dict[str, Optional[str]] = {}
             if tickers and date_col:
                 existing = c.execute(
-                    f"SELECT ticker, {date_col} FROM {table} WHERE decision IS NULL AND outcome IS NULL "
+                    f"SELECT ticker, {date_col}, price, price_captured_at FROM {table} WHERE decision IS NULL AND outcome IS NULL "
                     f"AND ticker IN ({', '.join('?' * len(tickers))})",
                     tickers,
                 ).fetchall()
                 for row in existing:
                     val = row[date_col]
-                    if val:
-                        carried[row["ticker"]] = min(carried.get(row["ticker"], val), val)
+                    ticker = row["ticker"]
+                    if val and (ticker not in carried_date or val < carried_date[ticker]):
+                        carried_date[ticker] = val
+                        carried_price[ticker] = row["price"]
+                        carried_captured_at[ticker] = row["price_captured_at"]
             if tickers:
                 c.execute(
                     f"DELETE FROM {table} WHERE decision IS NULL AND outcome IS NULL "
@@ -674,8 +712,12 @@ class Database:
                 )
             if date_col:
                 for row in rows:
-                    if row["ticker"] in carried:
-                        row[date_col] = carried[row["ticker"]]
+                    ticker = row["ticker"]
+                    if ticker in carried_date:
+                        row[date_col] = carried_date[ticker]
+                        if carried_price.get(ticker) is not None:
+                            row["price"] = carried_price[ticker]
+                        row["price_captured_at"] = carried_captured_at.get(ticker)
             c.executemany(
                 f"INSERT INTO {table} ({', '.join(columns)}) VALUES ({placeholders})",
                 [{**row, "run_id": run_id} for row in rows],
@@ -754,7 +796,7 @@ class Database:
     # contract here.
     # ------------------------------------------------------------------
     _DIP_CANDIDATE_COLUMNS = [
-        "run_id", "ticker", "company_name", "price", "sector", "flagged_date",
+        "run_id", "ticker", "company_name", "price", "sector", "flagged_date", "price_captured_at",
         "drawdown_pct", "drawdown_lookback_days", "rsi_14", "analyst_recommendation",
         "analyst_target_mean_price", "analyst_upside_pct", "pe_ratio", "week52_low", "week52_high", "debt_to_equity",
         "industry",
@@ -827,7 +869,7 @@ class Database:
     # shape (run_id, ticker, flagged_date), just a different table.
     # ------------------------------------------------------------------
     _THREE_DAY_CANDIDATE_COLUMNS = [
-        "run_id", "ticker", "company_name", "price", "sector", "flagged_date",
+        "run_id", "ticker", "company_name", "price", "sector", "flagged_date", "price_captured_at",
         "last_earnings_date", "days_since_earnings", "window_start_date", "window_end_date",
         "anchor_close", "window_last_close", "drawdown_pct", "down_day_count", "surprise_pct",
         "rsi_14", "analyst_recommendation", "analyst_target_mean_price", "analyst_upside_pct",

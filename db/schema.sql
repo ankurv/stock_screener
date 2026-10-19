@@ -173,6 +173,10 @@ CREATE TABLE IF NOT EXISTS put_candidate (
     first_seen_at     TEXT,              -- ISO date first flagged - the tracking "start date". Preserved across
                                           -- re-generations of the same still-pending ticker (see db.save_candidates),
                                           -- not reset to today every time a run re-surfaces it.
+    price_captured_at TEXT,              -- full ISO8601 UTC timestamp of the exact moment `price` above was read -
+                                          -- carried forward alongside first_seen_at/price so a re-surfaced pending
+                                          -- ticker's recorded "when" stays pinned to its real original capture, not
+                                          -- just the date (which on its own can't tell a 9:35am entry from a 3:55pm one)
     expiry            TEXT NOT NULL,
     strike            REAL NOT NULL,
     bid               REAL,
@@ -239,6 +243,8 @@ CREATE TABLE IF NOT EXISTS dip_candidate (
     price             REAL,              -- entry price: underlying price at the time flagged
     sector            TEXT,
     flagged_date      TEXT NOT NULL,     -- ISO date this candidate was surfaced
+    price_captured_at TEXT,              -- full ISO8601 UTC timestamp of the exact moment `price` above was read -
+                                          -- see put_candidate.price_captured_at for the full rationale
     drawdown_pct      REAL,              -- % change over drawdown_lookback_days (negative)
     drawdown_lookback_days INTEGER,
     rsi_14            REAL,
@@ -288,6 +294,8 @@ CREATE TABLE IF NOT EXISTS three_day_candidate (
     price             REAL,              -- entry price: underlying price at the time flagged (end of the correction window)
     sector            TEXT,
     flagged_date      TEXT NOT NULL,     -- ISO date this candidate was surfaced
+    price_captured_at TEXT,              -- full ISO8601 UTC timestamp of the exact moment `price` above was read -
+                                          -- see put_candidate.price_captured_at for the full rationale
     last_earnings_date    TEXT,          -- the past, already-reported quarter this correction is measured from
     days_since_earnings   INTEGER,
     window_start_date     TEXT,          -- first of the 3 correction-window trading days

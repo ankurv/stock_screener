@@ -210,6 +210,7 @@ def generate(db, cfg: dict, universe: list[dict]) -> list[dict]:
                 "price": round(price, 2),
                 "sector": row.get("sector"),
                 "flagged_date": flagged_date,
+                "price_captured_at": db.get_price_captured_at(ticker),
                 "last_earnings_date": last_earnings_date.isoformat(),
                 "days_since_earnings": days_since_earnings,
                 "window_start_date": window["window_start_date"],

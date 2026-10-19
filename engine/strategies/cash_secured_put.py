@@ -96,6 +96,9 @@ def generate(db, cfg: dict, universe: list[dict]) -> list[dict]:
             relative_strength_pct=relative_strength_pct,
             historical_drawdown_stats=historical_drawdown_stats,
         )
+        price_captured_at = db.get_price_captured_at(ticker)
+        for cand in cands:
+            cand["price_captured_at"] = price_captured_at
         all_candidates.extend(cands)
 
     return select_top_candidates(all_candidates, strat_cfg)

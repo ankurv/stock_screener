@@ -294,7 +294,7 @@
           {% for h in history %}
           <tr>
             <td>{{ h.ticker }}</td>
-            <td>{{ h.first_seen_at or "n/a" }}</td>
+            <td>{{ h.first_seen_at or "n/a" }}{% if h.price_captured_at %} <span class="muted">{{ h.price_captured_at[11:16] }} UTC</span>{% endif %}</td>
             <td>{{ h.expiry }}</td>
             <td>${{ "%.2f"|format(h.strike) }}</td>
             <td>${{ "%.0f"|format(h.premium_total) }}</td>
@@ -362,7 +362,7 @@
           <div class="metric"><span class="metric-label">Drawdown</span><span class="metric-value highlight">{{ "%.1f"|format(c.drawdown_pct) }}% / {{ c.drawdown_lookback_days }}d</span></div>
           <div class="metric"><span class="metric-label">RSI (14)</span><span class="metric-value">{{ "%.0f"|format(c.rsi_14) if c.rsi_14 is not none else "n/a" }}</span></div>
           <div class="metric"><span class="metric-label">Risk</span><span class="metric-value risk-{{ (c.risk_label or "")|lower }}">{{ c.risk_label }} ({{ "%.0f"|format(c.risk_score) }})</span></div>
-          <div class="metric"><span class="metric-label">Flagged</span><span class="metric-value">{{ c.flagged_date }}</span></div>
+          <div class="metric"><span class="metric-label">Flagged</span><span class="metric-value">{{ c.flagged_date }}{% if c.price_captured_at %} <span class="muted">{{ c.price_captured_at[11:16] }} UTC</span>{% endif %}</span></div>
           <div class="metric"><span class="metric-label">P/E (trailing)</span><span class="metric-value">{{ "%.1f"|format(c.pe_ratio) if c.pe_ratio is not none else "n/a" }}</span></div>
           <div class="metric"><span class="metric-label">52wk range</span><span class="metric-value">{{ "${:.0f}".format(c.week52_low) if c.week52_low is not none else "n/a" }} - {{ "${:.0f}".format(c.week52_high) if c.week52_high is not none else "n/a" }}</span></div>
           <div class="metric"><span class="metric-label">Debt/Equity</span><span class="metric-value {{ 'risk-high' if c.debt_to_equity is not none and c.debt_to_equity >= 200 else '' }}">{{ "%.0f%%"|format(c.debt_to_equity) if c.debt_to_equity is not none else "n/a" }}</span></div>
@@ -415,7 +415,7 @@
           {% for h in dip_history %}
           <tr>
             <td>{{ h.ticker }}</td>
-            <td>{{ h.flagged_date }}</td>
+            <td>{{ h.flagged_date }}{% if h.price_captured_at %} <span class="muted">{{ h.price_captured_at[11:16] }} UTC</span>{% endif %}</td>
             <td class="cell-resolved-date">{{ h.evaluated_at[:10] if h.evaluated_at else "n/a" }}</td>
             <td>${{ "%.2f"|format(h.price) if h.price is not none else "n/a" }}</td>
             <td class="cell-resolved-price">${{ "%.2f"|format(h.resolved_price) if h.resolved_price is not none else "n/a" }}</td>
@@ -483,7 +483,7 @@
           <div class="metric"><span class="metric-label">EPS surprise</span><span class="metric-value">{{ "%+.1f%%"|format(c.surprise_pct) if c.surprise_pct is not none else "n/a" }}</span></div>
           <div class="metric"><span class="metric-label">RSI (14)</span><span class="metric-value">{{ "%.0f"|format(c.rsi_14) if c.rsi_14 is not none else "n/a" }}</span></div>
           <div class="metric"><span class="metric-label">Risk</span><span class="metric-value risk-{{ (c.risk_label or "")|lower }}">{{ c.risk_label }} ({{ "%.0f"|format(c.risk_score) }})</span></div>
-          <div class="metric"><span class="metric-label">Flagged</span><span class="metric-value">{{ c.flagged_date }}</span></div>
+          <div class="metric"><span class="metric-label">Flagged</span><span class="metric-value">{{ c.flagged_date }}{% if c.price_captured_at %} <span class="muted">{{ c.price_captured_at[11:16] }} UTC</span>{% endif %}</span></div>
           <div class="metric"><span class="metric-label">P/E (trailing)</span><span class="metric-value">{{ "%.1f"|format(c.pe_ratio) if c.pe_ratio is not none else "n/a" }}</span></div>
           <div class="metric"><span class="metric-label">52wk range</span><span class="metric-value">{{ "${:.0f}".format(c.week52_low) if c.week52_low is not none else "n/a" }} - {{ "${:.0f}".format(c.week52_high) if c.week52_high is not none else "n/a" }}</span></div>
           <div class="metric"><span class="metric-label">Debt/Equity</span><span class="metric-value {{ 'risk-high' if c.debt_to_equity is not none and c.debt_to_equity >= 200 else '' }}">{{ "%.0f%%"|format(c.debt_to_equity) if c.debt_to_equity is not none else "n/a" }}</span></div>
@@ -536,7 +536,7 @@
           {% for h in three_day_history %}
           <tr>
             <td>{{ h.ticker }}</td>
-            <td>{{ h.flagged_date }}</td>
+            <td>{{ h.flagged_date }}{% if h.price_captured_at %} <span class="muted">{{ h.price_captured_at[11:16] }} UTC</span>{% endif %}</td>
             <td class="cell-resolved-date">{{ h.evaluated_at[:10] if h.evaluated_at else "n/a" }}</td>
             <td>${{ "%.2f"|format(h.price) if h.price is not none else "n/a" }}</td>
             <td class="cell-resolved-price">${{ "%.2f"|format(h.resolved_price) if h.resolved_price is not none else "n/a" }}</td>

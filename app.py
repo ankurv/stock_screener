@@ -20,6 +20,7 @@ browser) runs independently of that and needs no button - see
 from __future__ import annotations
 
 import threading
+from concurrent.futures import ThreadPoolExecutor, as_completed
 import time
 from datetime import datetime, timezone
 from pathlib import Path
@@ -180,22 +181,50 @@ def _dip_history_summary(history: list[dict]) -> dict:
     }
 
 
-def _attach_live_returns(strat, history: list[dict]):
+def _fetch_live_prices(tickers: set) -> dict:
+    """
+    Concurrent live fetch (ThreadPoolExecutor, same pattern as
+    data_sources.market_data.refresh_market_data) for every ticker with a
+    still-pending track-record row across all strategies. A real network
+    hit, not the cached price_snapshot - that cache only updates when
+    something else happens to touch that specific ticker (a pipeline run
+    that includes it, a manual refresh-price click), so a position that's
+    been pending for a few days with nothing else refreshing it would
+    otherwise show a stale, misleadingly-flat "live" return. Bounded to
+    just the handful of tickers that actually need one, not the whole
+    universe, so this stays fast even though it's a real fetch.
+    """
+    prices = {}
+    if not tickers:
+        return prices
+    with ThreadPoolExecutor(max_workers=8) as pool:
+        futures = {pool.submit(fetch_price, t): t for t in tickers}
+        for fut in as_completed(futures):
+            ticker = futures[fut]
+            try:
+                price = fut.result()
+            except Exception as exc:  # noqa: BLE001
+                log.warning("Live price fetch failed for %s: %s", ticker, exc)
+                price = None
+            if price:
+                prices[ticker] = price
+    return prices
+
+
+def _attach_live_returns(strat, history: list[dict], live_prices: dict):
     """
     Fills in `live_return_pct` on every still-pending (outcome not yet set)
     track-record row, so the dashboard shows an unrealized mark-to-market
     estimate by default instead of a blank "n/a" until someone clicks the
-    row's manual refresh (⟳) button. Reads the already-cached price_snapshot
-    (db.get_price, no ttl) rather than a fresh live fetch per row - unlike
-    the ⟳ button's /api/history/refresh (which does hit the network and also
-    checks true resolution), this just needs to be cheap enough to run on
-    every dashboard load across up to 50 rows per strategy. Never touches
-    the locked-in `return_pct` column - this is display-only.
+    row's manual refresh (⟳) button. `live_prices` comes from
+    _fetch_live_prices - a real quote, not the cached price_snapshot, so
+    this reflects actual price movement since the row was flagged. Never
+    touches the locked-in `return_pct` column - this is display-only.
     """
     for h in history:
         if h.get("outcome"):
             continue
-        price = db.get_price(h["ticker"])
+        price = live_prices.get(h["ticker"])
         h["live_return_pct"] = round(strat.live_return_pct(h, price), 2) if price else None
 
 
@@ -224,9 +253,13 @@ def dashboard(request: Request):
     history = db.get_recommendation_history(limit=50)
     dip_history = db.get_dip_history(limit=50)
     three_day_history = db.get_three_day_history(limit=50)
-    _attach_live_returns(STRATEGIES["cash_secured_put"], history)
-    _attach_live_returns(STRATEGIES["dip_buy"], dip_history)
-    _attach_live_returns(STRATEGIES["three_day_rule"], three_day_history)
+    pending_tickers = {
+        h["ticker"] for h in (history + dip_history + three_day_history) if not h.get("outcome")
+    }
+    live_prices = _fetch_live_prices(pending_tickers)
+    _attach_live_returns(STRATEGIES["cash_secured_put"], history, live_prices)
+    _attach_live_returns(STRATEGIES["dip_buy"], dip_history, live_prices)
+    _attach_live_returns(STRATEGIES["three_day_rule"], three_day_history, live_prices)
     market_mood = _pulse_cache.get("market_mood") or db.get_market_mood() or {}
     market_news = _pulse_cache.get("market_news") or db.get_news(MARKET_NEWS_KEY, limit=8) or []
     pulse_by_ticker = {q["ticker"]: q for q in _pulse_cache.get("pulse", [])}

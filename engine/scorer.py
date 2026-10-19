@@ -276,9 +276,11 @@ def evaluate_candidates(
                 "company_name": company_name,
                 "price": round(price, 2),
                 "sector": sector,
-                # Default to today - db.save_candidates overrides this with the
-                # ORIGINAL first-seen date if this ticker was already pending
-                # from an earlier, still-undecided run (see its docstring).
+                # Default to today - db.save_candidates overrides this (and
+                # price_captured_at, set by the caller - see engine.strategies.
+                # cash_secured_put.generate, this function stays I/O-free) with
+                # the ORIGINAL first-seen date/time if this ticker was already
+                # pending from an earlier, still-undecided run (see its docstring).
                 "first_seen_at": today.isoformat(),
                 "expiry": row["expiry"],
                 "strike": strike,
