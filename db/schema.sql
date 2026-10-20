@@ -113,6 +113,25 @@ CREATE TABLE IF NOT EXISTS analyst_snapshot (
     updated_at          TEXT NOT NULL
 );
 
+-- One row per ticker per calendar day the analyst snapshot above was
+-- refreshed - a bounded-growth history (fetched at most once/day/ticker,
+-- see cache_ttl_minutes.analyst_snapshot) so a revision-momentum signal can
+-- compare "where is the rating/target trending", not just today's single
+-- point-in-time read. Additive alongside analyst_snapshot, not a replacement -
+-- every existing reader of analyst_snapshot is unaffected.
+CREATE TABLE IF NOT EXISTS analyst_snapshot_history (
+    ticker              TEXT NOT NULL,
+    snapshot_date       TEXT NOT NULL,   -- ISO date (UTC) this row was captured
+    recommendation_key  TEXT,
+    recommendation_mean REAL,
+    num_analysts        INTEGER,
+    target_mean_price   REAL,
+    target_high_price   REAL,
+    target_low_price    REAL,
+    updated_at          TEXT NOT NULL,
+    PRIMARY KEY (ticker, snapshot_date)
+);
+
 -- SEC 8-K ("material event") filings per ticker
 CREATE TABLE IF NOT EXISTS sec_8k_filing (
     ticker        TEXT NOT NULL,
@@ -230,6 +249,82 @@ CREATE TABLE IF NOT EXISTS put_candidate (
     PRIMARY KEY (run_id, ticker, expiry, strike)
 );
 
+-- Raw call-option contract snapshots - same shape as put_option_snapshot,
+-- the other side of the same option_chain() fetch (see
+-- data_sources.market_data.fetch_weekly_option_chain) feeding covered_call.
+CREATE TABLE IF NOT EXISTS call_option_snapshot (
+    ticker          TEXT NOT NULL,
+    expiry          TEXT NOT NULL,
+    strike          REAL NOT NULL,
+    bid             REAL,
+    ask             REAL,
+    last_price      REAL,
+    implied_vol     REAL,
+    open_interest    INTEGER,
+    volume          INTEGER,
+    in_the_money     INTEGER,
+    updated_at      TEXT NOT NULL,
+    PRIMARY KEY (ticker, expiry, strike)
+);
+
+-- "Covered call" strategy (see engine/strategies/covered_call.py) - sells
+-- calls against 100 shares you already hold (or are willing to acquire),
+-- the mirror image of cash-secured puts: capped upside instead of
+-- downside protection. Same shape/signals as put_candidate; a few fields
+-- are renamed for the direction (shares_value instead of collateral -
+-- there's no cash collateral here, what's "at risk" is the 100 shares'
+-- value) and the outcome vocabulary is simpler (see classify_outcome in
+-- covered_call.py - a call sold OTM can't realistically assign below your
+-- own entry price, unlike a put, so there's no loss-on-assignment state).
+CREATE TABLE IF NOT EXISTS call_candidate (
+    run_id            INTEGER NOT NULL,
+    ticker            TEXT NOT NULL,
+    company_name      TEXT,
+    price             REAL,              -- underlying price at the time of this recommendation (your tracked entry)
+    sector            TEXT,
+    first_seen_at     TEXT,              -- see put_candidate.first_seen_at
+    price_captured_at TEXT,              -- see put_candidate.price_captured_at
+    expiry            TEXT NOT NULL,
+    strike            REAL NOT NULL,
+    bid               REAL,
+    ask               REAL,
+    mid_price         REAL,
+    shares_value      REAL,              -- price * 100 - the value of the shares "covering" this call, CSP's collateral equivalent
+    premium_total     REAL,
+    annualized_yield_pct REAL,
+    prob_otm_pct      REAL,
+    delta             REAL,
+    open_interest     INTEGER,
+    spread_pct        REAL,
+    days_to_expiry    INTEGER,
+    earnings_before_expiry INTEGER,
+    analyst_recommendation TEXT,
+    analyst_target_mean_price REAL,
+    pe_ratio          REAL,
+    week52_low        REAL,
+    week52_high       REAL,
+    debt_to_equity    REAL,
+    industry          TEXT,
+    relative_strength_pct REAL,
+    historical_median_depth_pct REAL,
+    historical_median_duration_days INTEGER,
+    earnings_anomaly_type TEXT,
+    composite_score   REAL,
+    risk_score        REAL,
+    risk_label        TEXT,
+    rsi_14            REAL,
+    trend             TEXT,
+    macd_bullish      INTEGER,
+    rank              INTEGER,
+    outcome              TEXT,    -- NULL (pending) | 'won' (expired OTM, kept shares+premium) | 'assigned' (called away at strike)
+    expiry_close_price   REAL,
+    evaluated_at         TEXT,
+    return_pct           REAL,    -- see covered_call.realized_return_pct - premium-only if 'won', premium + (strike-entry) if 'assigned'
+    decision             TEXT,    -- NULL (pending) | 'accepted' | 'ignored'
+    decided_at           TEXT,
+    PRIMARY KEY (run_id, ticker, expiry, strike)
+);
+
 -- "Dip buy" strategy: stocks flagged for a sharp recent correction that still
 -- look buyable (not a falling knife) - see engine/strategies/dip_buy.py. A
 -- watchlist, not a sized portfolio, so no strike/collateral/premium columns -
@@ -336,4 +431,67 @@ CREATE TABLE IF NOT EXISTS three_day_candidate (
     decision             TEXT,    -- NULL (pending) | 'accepted' | 'ignored'
     decided_at           TEXT,
     PRIMARY KEY (run_id, ticker, flagged_date)
+);
+
+-- "Weekly call buy" strategy (see engine/strategies/weekly_call_buy.py) -
+-- genuinely different risk shape from every other strategy here: this one
+-- BUYS a short-dated call as a directional, leveraged, defined-risk bet
+-- (max loss = premium paid) instead of selling premium for income. Reuses
+-- call_option_snapshot (same chain data covered_call already caches) but
+-- its own scoring: buying wants a *cheap* premium relative to a strong
+-- bullish signal, not a rich one - the opposite of what covered_call/
+-- cash_secured_put reward.
+CREATE TABLE IF NOT EXISTS weekly_call_buy_candidate (
+    run_id            INTEGER NOT NULL,
+    ticker            TEXT NOT NULL,
+    company_name      TEXT,
+    price             REAL,              -- underlying price at the time of this recommendation
+    sector            TEXT,
+    first_seen_at     TEXT,
+    price_captured_at TEXT,
+    expiry            TEXT NOT NULL,     -- this week's expiry - see pick_nearest_weekly_expiry
+    strike            REAL NOT NULL,
+    bid               REAL,
+    ask               REAL,
+    mid_price         REAL,
+    premium_total     REAL,              -- the actual capital at risk (ask * 100, conservative: assume you pay the ask) - NOT
+                                          -- collateral/shares_value like the selling strategies; there's nothing else "tied up"
+    breakeven_price   REAL,              -- strike + premium_per_share - the underlying price needed at expiry just to break even
+    required_move_pct REAL,              -- (breakeven - price) / price * 100 - how far the stock has to rally; the single
+                                          -- most useful "how much of a long shot is this" number for a bought option
+    prob_profit_pct   REAL,              -- modeled P(close > breakeven) at expiry (engine.greeks.call_greeks applied to the
+                                          -- breakeven price instead of the strike) - a tighter bar than plain prob-ITM
+    delta             REAL,
+    implied_vol       REAL,
+    open_interest     INTEGER,
+    spread_pct        REAL,
+    days_to_expiry    INTEGER,
+    analyst_recommendation TEXT,
+    analyst_target_mean_price REAL,
+    pe_ratio          REAL,
+    week52_low        REAL,
+    week52_high       REAL,
+    debt_to_equity    REAL,
+    industry          TEXT,
+    relative_strength_pct REAL,          -- this stock's trend minus the benchmark's - POSITIVE is the whole point here
+                                          -- (outperformance = the bullish signal), opposite framing from the other strategies'
+                                          -- "is chronic underperformance a risk" use of the same underlying number
+    rsi_14            REAL,
+    trend             TEXT,
+    macd_bullish      INTEGER,
+    composite_score   REAL,
+    risk_score        REAL,
+    risk_label        TEXT,
+    rank              INTEGER,
+    -- Outcome tracking: scored at expiry against the underlying close, same
+    -- "every row is a recommendation, this table doubles as history" pattern.
+    outcome              TEXT,    -- NULL (pending) | 'win' (close >= breakeven) | 'partial_loss' (ITM but short of
+                                   -- breakeven) | 'max_loss' (expired at/below strike - premium is a 100% loss)
+    expiry_close_price   REAL,
+    evaluated_at         TEXT,
+    return_pct           REAL,    -- % return on the PREMIUM paid (the real capital base for a bought option), locked in
+                                   -- once resolved - see weekly_call_buy.realized_return_pct
+    decision             TEXT,    -- NULL (pending) | 'accepted' | 'ignored'
+    decided_at           TEXT,
+    PRIMARY KEY (run_id, ticker, expiry, strike)
 );

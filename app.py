@@ -166,6 +166,34 @@ def _history_summary(history: list[dict]) -> dict:
     }
 
 
+def _call_history_summary(history: list[dict]) -> dict:
+    """See _history_summary - covered_call's simpler 'won'/'assigned' outcome scheme (no loss-on-assignment state)."""
+    total = len(history)
+    won = sum(1 for h in history if h["outcome"] == "won")
+    assigned = sum(1 for h in history if h["outcome"] == "assigned")
+    return {
+        "total": total,
+        "won": won,
+        "assigned": assigned,
+        "win_rate_pct": round(won / total * 100.0, 1) if total else None,
+    }
+
+
+def _weekly_call_buy_history_summary(history: list[dict]) -> dict:
+    """See _history_summary - weekly_call_buy's 'win'/'partial_loss'/'max_loss' outcome scheme."""
+    total = len(history)
+    win = sum(1 for h in history if h["outcome"] == "win")
+    partial_loss = sum(1 for h in history if h["outcome"] == "partial_loss")
+    max_loss = sum(1 for h in history if h["outcome"] == "max_loss")
+    return {
+        "total": total,
+        "win": win,
+        "partial_loss": partial_loss,
+        "max_loss": max_loss,
+        "win_rate_pct": round(win / total * 100.0, 1) if total else None,
+    }
+
+
 def _dip_history_summary(history: list[dict]) -> dict:
     """Generic over any strategy using the rebounded/flat/further_decline outcome scheme - also used by three_day_rule."""
     total = len(history)
@@ -239,9 +267,16 @@ def dashboard(request: Request):
     candidates = db.get_latest_candidates(active_only=True)
     dip_candidates = db.get_latest_dip_candidates(active_only=True)
     three_day_candidates = db.get_latest_three_day_candidates(active_only=True)
+    call_candidates = db.get_latest_call_candidates(active_only=True)
+    weekly_call_buy_candidates = db.get_latest_weekly_call_buy_candidates(active_only=True)
     last_run = db.get_latest_run()
-    events_by_ticker = {c["ticker"]: _build_events_for_ticker(c["ticker"]) for c in candidates}
-    all_active_tickers = {c["ticker"] for c in candidates + dip_candidates + three_day_candidates}
+    events_by_ticker = {
+        c["ticker"]: _build_events_for_ticker(c["ticker"])
+        for c in candidates + call_candidates + weekly_call_buy_candidates
+    }
+    all_active_tickers = {
+        c["ticker"] for c in candidates + dip_candidates + three_day_candidates + call_candidates + weekly_call_buy_candidates
+    }
     # The 'stock_split' news category (data_sources.news_rss) was being
     # classified and stored but never actually shown anywhere - checked
     # here, at render time, rather than baked into each candidate row,
@@ -253,13 +288,18 @@ def dashboard(request: Request):
     history = db.get_recommendation_history(limit=50)
     dip_history = db.get_dip_history(limit=50)
     three_day_history = db.get_three_day_history(limit=50)
+    call_history = db.get_call_history(limit=50)
+    weekly_call_buy_history = db.get_weekly_call_buy_history(limit=50)
     pending_tickers = {
-        h["ticker"] for h in (history + dip_history + three_day_history) if not h.get("outcome")
+        h["ticker"] for h in (history + dip_history + three_day_history + call_history + weekly_call_buy_history)
+        if not h.get("outcome")
     }
     live_prices = _fetch_live_prices(pending_tickers)
     _attach_live_returns(STRATEGIES["cash_secured_put"], history, live_prices)
     _attach_live_returns(STRATEGIES["dip_buy"], dip_history, live_prices)
     _attach_live_returns(STRATEGIES["three_day_rule"], three_day_history, live_prices)
+    _attach_live_returns(STRATEGIES["covered_call"], call_history, live_prices)
+    _attach_live_returns(STRATEGIES["weekly_call_buy"], weekly_call_buy_history, live_prices)
     market_mood = _pulse_cache.get("market_mood") or db.get_market_mood() or {}
     market_news = _pulse_cache.get("market_news") or db.get_news(MARKET_NEWS_KEY, limit=8) or []
     pulse_by_ticker = {q["ticker"]: q for q in _pulse_cache.get("pulse", [])}
@@ -273,6 +313,8 @@ def dashboard(request: Request):
             "candidates": candidates,
             "dip_candidates": dip_candidates,
             "three_day_candidates": three_day_candidates,
+            "call_candidates": call_candidates,
+            "weekly_call_buy_candidates": weekly_call_buy_candidates,
             "events_by_ticker": events_by_ticker,
             "recent_split_tickers": recent_split_tickers,
             "last_run": last_run,
@@ -292,6 +334,10 @@ def dashboard(request: Request):
             "dip_history_summary": _dip_history_summary(dip_history),
             "three_day_history": three_day_history,
             "three_day_history_summary": _dip_history_summary(three_day_history),
+            "call_history": call_history,
+            "call_history_summary": _call_history_summary(call_history),
+            "weekly_call_buy_history": weekly_call_buy_history,
+            "weekly_call_buy_history_summary": _weekly_call_buy_history_summary(weekly_call_buy_history),
             "refresh_states": _refresh_states,
             "universe_rebuild": _universe_rebuild_state,
         },

@@ -68,6 +68,8 @@ strategies_enabled:
   - cash_secured_put
   - dip_buy
   - three_day_rule
+  - covered_call
+  - weekly_call_buy
 
 # Once you accept or ignore a candidate, it won't be re-surfaced by a later
 # "Generate" for this many days, even if it would otherwise still qualify -
@@ -121,6 +123,76 @@ strategies:
       analyst_sentiment: 0.17
       earnings_penalty: 0.10
       anomaly_penalty: 0.05   # extra penalty if the last earnings reaction was a "beat but stock sold off anyway" anomaly
+
+  # --- Covered calls -----------------------------------------------------------
+  # Mirror of cash_secured_put for the opposite direction - sells calls
+  # against 100 shares you already hold (or are willing to acquire),
+  # capping upside instead of protecting downside. Same thresholds as
+  # cash_secured_put to start (own risk/reward shape not yet tuned
+  # separately) - see engine/strategies/covered_call.py.
+  covered_call:
+    max_candidates: 10
+    min_composite_score: 0.35
+    max_per_sector: 5
+    min_annualized_yield_pct: 8.0
+    min_bid_price: 0.50
+    min_open_interest: 50
+    max_bid_ask_spread_pct: 20.0
+    target_prob_otm_min: 0.60
+    exclude_if_earnings_before_expiry: false
+    strike_otm_pct_max: 5.0                 # hard filter: strike must be within this % above current price (0% = ATM)
+    strike_otm_pct_max_with_earnings: 15.0
+    relative_strength_lookback_days: 10
+    historical_drawdown_min_depth_pct: -15.0
+    weights:
+      annualized_yield: 0.40
+      probability_otm: 0.23
+      liquidity: 0.15
+      analyst_sentiment: 0.17
+      earnings_penalty: 0.10
+      anomaly_penalty: 0.05
+
+  # --- Weekly call buys ---------------------------------------------------------
+  # Genuinely different risk shape from the other 4: BUYS a short-dated call
+  # outright (max loss = premium paid) as a directional, leveraged bet on
+  # real outperformance, instead of selling premium for income. Hard filters
+  # are stricter than the dip-buying strategies given the short window and
+  # decaying premium - see engine/strategies/weekly_call_buy.py.
+  weekly_call_buy:
+    max_candidates: 10
+    min_composite_score: 0.35
+    max_per_sector: 5
+    min_bid_price: 0.20                   # the ask floor, really - cheaper than the selling strategies' floor since
+                                           # short-dated OTM calls are often this cheap by design
+    min_open_interest: 50
+    max_bid_ask_spread_pct: 25.0          # a bit wider than the selling strategies - short-dated weekly contracts
+                                           # on momentum names quote wider than the typical CSP candidate
+    strike_otm_pct_min: -2.0               # allows slightly in-the-money strikes (higher delta, less pure time-value)
+    strike_otm_pct_max: 8.0                 # up to moderately OTM for more leverage
+    min_relative_strength_pct: 2.0         # hard filter: must be outperforming the benchmark by at least this much
+                                            # over the lookback - the whole thesis is real outperformance, not "not falling"
+    relative_strength_lookback_days: 10
+    min_analyst_score: 0.5                 # same convention as dip_buy - screens out names being correctly re-rated down
+    legal_news_lookback_days: 10
+    max_required_move_pct: 10.0            # hard filter: the underlying must not need to rally more than this just to
+                                            # break even (strike + premium) - past this it's a lottery ticket, not a pick
+    weights:
+      bullish_strength: 0.40               # how far outperforming the benchmark - the core bullish signal
+      cheap_move: 0.30                     # smaller required_move_pct (relative to the cap above) is more attractive
+      liquidity: 0.15
+      analyst_sentiment: 0.15
+    # Risk-score blend (sums to 1.0) - IV dominates here too, but for a
+    # different reason than the selling strategies: a rich premium plus
+    # IV-crush exposure, not a bigger expected adverse swing. required_move
+    # and time-decay (days actually left before this week's expiry) are the
+    # next-biggest factors, with market mood/technicals/leverage secondary.
+    risk_weights:
+      iv: 0.30
+      required_move: 0.25
+      time_decay: 0.20
+      market_mood: 0.10
+      technical: 0.10
+      leverage: 0.05
 
   # --- Dip buy watch ----------------------------------------------------------
   # "Overnight sweep": flags stocks that just saw a sharp correction but still

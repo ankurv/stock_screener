@@ -324,6 +324,399 @@
 
 <section class="strategy-panel">
   <div class="strategy-heading-row">
+    <h2 class="strategy-heading">Covered Call Candidates <span class="active-count-badge">{{ call_candidates|length }} active</span></h2>
+    <div class="strategy-actions">
+      <span id="refresh-status-covered_call" class="muted">{% if refresh_states.covered_call.running %}{{ refresh_states.covered_call.step or "Generating..." }}{% endif %}</span>
+      <button id="refresh-btn-covered_call" class="generate-btn" onclick="startRefresh('covered_call')" {% if refresh_states.covered_call.running %}disabled{% endif %}>Generate</button>
+    </div>
+  </div>
+  {% if not call_candidates %}
+    <p class="empty-state">No active recommendations right now. Click "Generate" to scan for new ones.</p>
+  {% else %}
+  <details class="list-toggle" open>
+    <summary>Recommendations ({{ call_candidates|length }})</summary>
+  <div class="candidates">
+    {% for c in call_candidates %}
+    <div class="candidate-card {{ 'top-pick' if c.rank == 1 else '' }}">
+      <div class="candidate-summary">
+        <span class="rank-badge-sm">#{{ c.rank }}</span>
+        <span class="dip-card-ticker">{{ c.ticker }}</span>
+        <span class="current-price">${{ "%.2f"|format(c.price) if c.price is not none else "n/a" }}</span>
+        {% if c.rank == 1 %}<span class="top-pick-badge">Top pick</span>{% endif %}
+        <span class="dip-card-spacer"></span>
+        <span class="metric-value">${{ "%.2f"|format(c.strike) }} strike</span>
+        <span class="metric-value highlight">{{ "%.1f"|format(c.annualized_yield_pct) }}%</span>
+        <span class="metric-value risk-{{ (c.risk_label or "")|lower }}">{{ c.risk_label }}</span>
+        <span class="dip-card-score">{{ "%.3f"|format(c.composite_score) }}</span>
+        <button class="refresh-price-btn" title="Refresh live price" onclick="refreshPrice(this, '{{ c.ticker }}')">⟳</button>
+        <button class="accept-icon-btn" title="Accept" onclick="decideCandidate(this, 'covered_call', 'accepted')"
+          data-run-id="{{ c.run_id }}" data-ticker="{{ c.ticker }}" data-expiry="{{ c.expiry }}" data-strike="{{ c.strike }}">✓</button>
+        <button class="ignore-icon-btn" title="Ignore" onclick="decideCandidate(this, 'covered_call', 'ignored')"
+          data-run-id="{{ c.run_id }}" data-ticker="{{ c.ticker }}" data-expiry="{{ c.expiry }}" data-strike="{{ c.strike }}">✕</button>
+        <button class="expand-toggle-btn" title="Show more details" onclick="toggleCardBody(this)">▸</button>
+      </div>
+      <div class="candidate-body">
+      <div class="company-name">{{ c.company_name or "" }}</div>
+
+      <div class="metrics-grid">
+        <div class="metric"><span class="metric-label">Sell call</span><span class="metric-value">${{ "%.2f"|format(c.strike) }} strike <span class="muted">({{ "%.1f"|format((c.strike - c.price) / c.price * 100) if c.price else "n/a" }}% OTM)</span></span></div>
+        <div class="metric"><span class="metric-label">Expiry</span><span class="metric-value">{{ c.expiry }} ({{ c.days_to_expiry }}d)</span></div>
+        <div class="metric"><span class="metric-label">Bid / Ask</span><span class="metric-value">${{ "%.2f"|format(c.bid) }} / ${{ "%.2f"|format(c.ask) }} <span class="muted">({{ "%.1f"|format(c.spread_pct) if c.spread_pct is not none else "n/a" }}% spread)</span></span></div>
+        <div class="metric"><span class="metric-label">Shares value (1 lot)</span><span class="metric-value">${{ "{:,.0f}".format(c.shares_value) }}</span></div>
+        <div class="metric"><span class="metric-label">Premium (1 lot)</span><span class="metric-value">${{ "%.0f"|format(c.premium_total) }}</span></div>
+        <div class="metric"><span class="metric-label">Annualized yield</span><span class="metric-value highlight">{{ "%.1f"|format(c.annualized_yield_pct) }}%</span></div>
+        <div class="metric"><span class="metric-label">Prob. OTM (modeled)</span><span class="metric-value">{{ "%.1f"|format(c.prob_otm_pct) }}%</span></div>
+        <div class="metric"><span class="metric-label">Delta</span><span class="metric-value">{{ "%.3f"|format(c.delta) }}</span></div>
+        <div class="metric"><span class="metric-label">Open interest</span><span class="metric-value">{{ c.open_interest }}</span></div>
+        <div class="metric"><span class="metric-label">Risk</span><span class="metric-value risk-{{ (c.risk_label or "")|lower }}">{{ c.risk_label }} ({{ "%.0f"|format(c.risk_score) }})</span></div>
+        <div class="metric"><span class="metric-label">RSI (14)</span><span class="metric-value">{{ "%.0f"|format(c.rsi_14) if c.rsi_14 is not none else "n/a" }}</span></div>
+        <div class="metric"><span class="metric-label">Trend</span><span class="metric-value">{{ c.trend|replace("_"," ")|title if c.trend else "n/a" }}</span></div>
+        <div class="metric"><span class="metric-label">MACD</span><span class="metric-value">{{ "Bullish" if c.macd_bullish == 1 else "Bearish" if c.macd_bullish == 0 else "n/a" }}</span></div>
+        <div class="metric"><span class="metric-label">P/E (trailing)</span><span class="metric-value">{{ "%.1f"|format(c.pe_ratio) if c.pe_ratio is not none else "n/a" }}</span></div>
+        <div class="metric"><span class="metric-label">52wk range</span><span class="metric-value">{{ "${:.0f}".format(c.week52_low) if c.week52_low is not none else "n/a" }} - {{ "${:.0f}".format(c.week52_high) if c.week52_high is not none else "n/a" }}</span></div>
+        <div class="metric"><span class="metric-label">Debt/Equity</span><span class="metric-value {{ 'risk-high' if c.debt_to_equity is not none and c.debt_to_equity >= 200 else '' }}">{{ "%.0f%%"|format(c.debt_to_equity) if c.debt_to_equity is not none else "n/a" }}</span></div>
+        <div class="metric"><span class="metric-label">vs Market</span><span class="metric-value {{ 'risk-high' if c.relative_strength_pct is not none and c.relative_strength_pct <= -15 else '' }}">{{ "%+.1f%%"|format(c.relative_strength_pct) if c.relative_strength_pct is not none else "n/a" }} <span class="muted">vs SPY</span></span></div>
+        <div class="metric"><span class="metric-label">Past corrections</span><span class="metric-value {{ 'risk-high' if c.historical_median_depth_pct is not none and c.historical_median_depth_pct <= -25 else '' }}">{{ "%.0f%%"|format(c.historical_median_depth_pct) if c.historical_median_depth_pct is not none else "n/a" }}{% if c.historical_median_duration_days is not none %} <span class="muted">/ {{ c.historical_median_duration_days }}d typical</span>{% endif %}</span></div>
+      </div>
+
+      <div class="badges">
+        {% if c.ticker in recent_split_tickers %}
+          <span class="badge badge-info" title="Recent news mentions a stock split for this ticker - double-check the strike/premium economics still make sense">⚠ Recent stock-split news</span>
+        {% endif %}
+        {% set sector_trend = sector_trend_by_name.get(c.sector) if c.sector else none %}
+        {% if c.sector and sector_trend is not none %}
+          <span class="badge {{ 'badge-sector-up' if sector_trend >= 0 else 'badge-sector-down' }}">
+            Sector: {{ c.sector }}{% if c.industry %} · {{ c.industry }}{% endif %} ({{ "%+.2f"|format(sector_trend) }}% / {{ sector_lookback_days }}d)
+          </span>
+        {% elif c.sector %}
+          <span class="badge badge-neutral">Sector: {{ c.sector }}</span>
+        {% endif %}
+        {% if c.earnings_before_expiry %}<span class="badge badge-warn">Earnings before expiry</span>{% endif %}
+        {% if c.earnings_anomaly_type == 'beat_but_sold_off' %}<span class="badge badge-danger">Beat last Q, stock sold off</span>{% endif %}
+        {% if c.earnings_anomaly_type == 'miss_but_rallied' %}<span class="badge badge-info">Missed last Q, stock rallied</span>{% endif %}
+        {% if c.analyst_recommendation %}<span class="badge badge-neutral">Analyst: {{ c.analyst_recommendation|replace("_"," ")|title }}{% if c.analyst_target_mean_price %} (avg target ${{ "%.0f"|format(c.analyst_target_mean_price) }}){% endif %}</span>{% endif %}
+      </div>
+
+      {% set ev = events_by_ticker.get(c.ticker) %}
+      {% if ev %}
+      <details class="events-panel">
+        <summary>Events &amp; filings for {{ c.ticker }}</summary>
+
+        <div class="events-grid">
+          <div class="events-col">
+            <h4>Earnings</h4>
+            {% if ev.earnings and ev.earnings.earnings_date %}
+              <p>Next: {{ ev.earnings.earnings_date }}{% if ev.earnings.is_estimate %} (estimated){% endif %}</p>
+            {% else %}
+              <p class="muted">No upcoming earnings date found.</p>
+            {% endif %}
+            {% if ev.reaction and ev.reaction.earnings_date %}
+              <p>Last report ({{ ev.reaction.earnings_date }}): EPS surprise {{ "%.1f"|format(ev.reaction.surprise_pct) }}%,
+                 price reaction {{ "%.1f"|format(ev.reaction.reaction_pct) }}%
+                 {% if ev.reaction.anomaly_type and ev.reaction.anomaly_type != 'normal' %}
+                   - <strong>anomaly: {{ ev.reaction.anomaly_type|replace("_"," ") }}</strong>
+                 {% endif %}
+              </p>
+            {% endif %}
+
+            <h4>13F - prominent investors</h4>
+            {% if ev.thirteenf %}
+              <ul>
+                {% for h in ev.thirteenf %}
+                  <li>{{ h.investor_name }}: {{ h.action }}
+                    {% if h.pct_change is not none %}({{ "%.1f"|format(h.pct_change) }}%){% endif %}
+                    as of {{ h.period_of_report }}</li>
+                {% endfor %}
+              </ul>
+            {% else %}
+              <p class="muted">No recent position changes among tracked investors.</p>
+            {% endif %}
+          </div>
+
+          <div class="events-col">
+            <h4>SEC 8-K filings (material events)</h4>
+            {% if ev.filings_8k %}
+              <ul>
+                {% for f in ev.filings_8k %}
+                  <li><a href="{{ f.filing_url }}" target="_blank" rel="noopener">{{ f.filed_date }}</a> - items {{ f['items'] or "n/a" }}</li>
+                {% endfor %}
+              </ul>
+            {% else %}
+              <p class="muted">No recent 8-K filings.</p>
+            {% endif %}
+
+            <h4>News</h4>
+            {% if ev.news %}
+              <ul>
+                {% for n in ev.news %}
+                  <li>
+                    <span class="badge badge-cat badge-cat-{{ n.category }}">{{ n.category }}</span>
+                    <a href="{{ n.link }}" target="_blank" rel="noopener">{{ n.title }}</a>
+                    <span class="muted">({{ n.source }})</span>
+                  </li>
+                {% endfor %}
+              </ul>
+            {% else %}
+              <p class="muted">No recent news items.</p>
+            {% endif %}
+          </div>
+        </div>
+      </details>
+      {% endif %}
+
+      </div>
+    </div>
+    {% endfor %}
+  </div>
+  </details>
+  {% endif %}
+
+  <details class="track-record-panel">
+    <summary>
+      Track record
+      {% if call_history_summary.total %}
+        - {{ call_history_summary.won }}/{{ call_history_summary.total }} won ({{ call_history_summary.win_rate_pct }}%)
+      {% else %}
+        - no expired recommendations yet
+      {% endif %}
+    </summary>
+    {% if call_history %}
+      <table class="history-table">
+        <thead>
+          <tr>
+            <th>Ticker</th><th>First seen</th><th>Expiry</th><th>Strike</th><th>Premium</th>
+            <th>Close @ expiry</th><th>Resolved</th><th>Return</th><th>Decision</th><th>Outcome</th><th></th>
+          </tr>
+        </thead>
+        <tbody>
+          {% for h in call_history %}
+          <tr>
+            <td>{{ h.ticker }}</td>
+            <td>{{ h.first_seen_at or "n/a" }}{% if h.price_captured_at %} <span class="muted">{{ h.price_captured_at[11:16] }} UTC</span>{% endif %}</td>
+            <td>{{ h.expiry }}</td>
+            <td>${{ "%.2f"|format(h.strike) }}</td>
+            <td>${{ "%.0f"|format(h.premium_total) }}</td>
+            <td class="cell-resolved-price">${{ "%.2f"|format(h.expiry_close_price) if h.expiry_close_price is not none else "n/a" }}</td>
+            <td class="cell-resolved-date">{{ h.evaluated_at[:10] if h.evaluated_at else "n/a" }}</td>
+            <td class="cell-return {{ 'pulse-up' if h.return_pct is not none and h.return_pct >= 0 else 'pulse-down' if h.return_pct is not none else 'pulse-up' if h.live_return_pct is not none and h.live_return_pct >= 0 else 'pulse-down' if h.live_return_pct is not none else '' }}{{ ' return-live-preview' if h.return_pct is none and h.live_return_pct is not none else '' }}"
+                {%- if h.return_pct is none and h.live_return_pct is not none %} title="Live estimate as of now, not locked in - the official return is only set once this is actually resolved."{% endif %}>{% if h.return_pct is not none %}{{ "%+.1f%%"|format(h.return_pct) }}{% elif h.live_return_pct is not none %}~{{ "%+.1f%%"|format(h.live_return_pct) }} (now){% else %}n/a{% endif %}</td>
+            <td>{% if h.decision %}<span class="badge decision-{{ h.decision }}">{{ h.decision|title }}</span>{% else %}<span class="muted">-</span>{% endif %}</td>
+            <td class="cell-outcome">{% if h.outcome %}<span class="badge outcome-{{ h.outcome }}">{{ h.outcome|replace("_"," ")|title }}</span>{% else %}<span class="muted">Pending</span>{% endif %}</td>
+            <td>
+              <button class="history-delete-btn" title="Stop tracking and delete this row" onclick="deleteHistoryRow(this, 'covered_call')"
+                data-run-id="{{ h.run_id }}" data-ticker="{{ h.ticker }}" data-expiry="{{ h.expiry }}" data-strike="{{ h.strike }}">✕</button>
+              {% if not h.outcome %}
+              <button class="refresh-outcome-btn" title="Check if this is resolvable now" onclick="refreshHistoryOutcome(this, 'covered_call')"
+                data-run-id="{{ h.run_id }}" data-ticker="{{ h.ticker }}" data-expiry="{{ h.expiry }}" data-strike="{{ h.strike }}">⟳</button>
+              {% endif %}
+            </td>
+          </tr>
+          {% endfor %}
+        </tbody>
+      </table>
+    {% else %}
+      <p class="muted">Recommendations are scored once their expiry has passed - checked each time the server starts.</p>
+    {% endif %}
+  </details>
+</section>
+
+<section class="strategy-panel">
+  <div class="strategy-heading-row">
+    <h2 class="strategy-heading">Weekly Call Buys <span class="active-count-badge">{{ weekly_call_buy_candidates|length }} active</span></h2>
+    <div class="strategy-actions">
+      <span id="refresh-status-weekly_call_buy" class="muted">{% if refresh_states.weekly_call_buy.running %}{{ refresh_states.weekly_call_buy.step or "Generating..." }}{% endif %}</span>
+      <button id="refresh-btn-weekly_call_buy" class="generate-btn" onclick="startRefresh('weekly_call_buy')" {% if refresh_states.weekly_call_buy.running %}disabled{% endif %}>Generate</button>
+    </div>
+  </div>
+  <p class="muted">Buys a short-dated call outright - a directional, leveraged bet with defined risk (max loss = premium paid), expiring within the week. Different risk shape from the other strategies here: this spends money up front instead of collecting it.</p>
+  {% if not weekly_call_buy_candidates %}
+    <p class="empty-state">No active recommendations right now. Click "Generate" to scan for new ones.</p>
+  {% else %}
+  <details class="list-toggle" open>
+    <summary>Recommendations ({{ weekly_call_buy_candidates|length }})</summary>
+  <div class="candidates">
+    {% for c in weekly_call_buy_candidates %}
+    <div class="candidate-card {{ 'top-pick' if c.rank == 1 else '' }}">
+      <div class="candidate-summary">
+        <span class="rank-badge-sm">#{{ c.rank }}</span>
+        <span class="dip-card-ticker">{{ c.ticker }}</span>
+        <span class="current-price">${{ "%.2f"|format(c.price) if c.price is not none else "n/a" }}</span>
+        {% if c.rank == 1 %}<span class="top-pick-badge">Top pick</span>{% endif %}
+        <span class="dip-card-spacer"></span>
+        <span class="metric-value">${{ "%.2f"|format(c.strike) }} strike</span>
+        <span class="metric-value highlight">needs +{{ "%.1f"|format(c.required_move_pct) }}%</span>
+        <span class="metric-value risk-{{ (c.risk_label or "")|lower }}">{{ c.risk_label }}</span>
+        <span class="dip-card-score">{{ "%.3f"|format(c.composite_score) }}</span>
+        <button class="refresh-price-btn" title="Refresh live price" onclick="refreshPrice(this, '{{ c.ticker }}')">⟳</button>
+        <button class="accept-icon-btn" title="Accept" onclick="decideCandidate(this, 'weekly_call_buy', 'accepted')"
+          data-run-id="{{ c.run_id }}" data-ticker="{{ c.ticker }}" data-expiry="{{ c.expiry }}" data-strike="{{ c.strike }}">✓</button>
+        <button class="ignore-icon-btn" title="Ignore" onclick="decideCandidate(this, 'weekly_call_buy', 'ignored')"
+          data-run-id="{{ c.run_id }}" data-ticker="{{ c.ticker }}" data-expiry="{{ c.expiry }}" data-strike="{{ c.strike }}">✕</button>
+        <button class="expand-toggle-btn" title="Show more details" onclick="toggleCardBody(this)">▸</button>
+      </div>
+      <div class="candidate-body">
+      <div class="company-name">{{ c.company_name or "" }}</div>
+
+      <div class="metrics-grid">
+        <div class="metric"><span class="metric-label">Buy call</span><span class="metric-value">${{ "%.2f"|format(c.strike) }} strike <span class="muted">({{ "%+.1f"|format((c.strike - c.price) / c.price * 100) if c.price else "n/a" }}% {{ "OTM" if c.strike >= c.price else "ITM" }})</span></span></div>
+        <div class="metric"><span class="metric-label">Expiry</span><span class="metric-value">{{ c.expiry }} ({{ c.days_to_expiry }}d)</span></div>
+        <div class="metric"><span class="metric-label">Bid / Ask</span><span class="metric-value">${{ "%.2f"|format(c.bid) }} / ${{ "%.2f"|format(c.ask) }} <span class="muted">({{ "%.1f"|format(c.spread_pct) if c.spread_pct is not none else "n/a" }}% spread)</span></span></div>
+        <div class="metric"><span class="metric-label">Premium paid (1 lot)</span><span class="metric-value">${{ "%.0f"|format(c.premium_total) }} <span class="muted">(max loss)</span></span></div>
+        <div class="metric"><span class="metric-label">Breakeven</span><span class="metric-value">${{ "%.2f"|format(c.breakeven_price) }} <span class="muted">(needs +{{ "%.1f"|format(c.required_move_pct) }}%)</span></span></div>
+        <div class="metric"><span class="metric-label">Prob. of profit (modeled)</span><span class="metric-value">{{ "%.1f"|format(c.prob_profit_pct) }}%</span></div>
+        <div class="metric"><span class="metric-label">Delta</span><span class="metric-value">{{ "%.3f"|format(c.delta) }}</span></div>
+        <div class="metric"><span class="metric-label">Implied vol</span><span class="metric-value">{{ "%.0f%%"|format(c.implied_vol * 100) if c.implied_vol is not none else "n/a" }}</span></div>
+        <div class="metric"><span class="metric-label">Open interest</span><span class="metric-value">{{ c.open_interest }}</span></div>
+        <div class="metric"><span class="metric-label">Risk</span><span class="metric-value risk-{{ (c.risk_label or "")|lower }}">{{ c.risk_label }} ({{ "%.0f"|format(c.risk_score) }})</span></div>
+        <div class="metric"><span class="metric-label">RSI (14)</span><span class="metric-value">{{ "%.0f"|format(c.rsi_14) if c.rsi_14 is not none else "n/a" }}</span></div>
+        <div class="metric"><span class="metric-label">Trend</span><span class="metric-value">{{ c.trend|replace("_"," ")|title if c.trend else "n/a" }}</span></div>
+        <div class="metric"><span class="metric-label">MACD</span><span class="metric-value">{{ "Bullish" if c.macd_bullish == 1 else "Bearish" if c.macd_bullish == 0 else "n/a" }}</span></div>
+        <div class="metric"><span class="metric-label">P/E (trailing)</span><span class="metric-value">{{ "%.1f"|format(c.pe_ratio) if c.pe_ratio is not none else "n/a" }}</span></div>
+        <div class="metric"><span class="metric-label">52wk range</span><span class="metric-value">{{ "${:.0f}".format(c.week52_low) if c.week52_low is not none else "n/a" }} - {{ "${:.0f}".format(c.week52_high) if c.week52_high is not none else "n/a" }}</span></div>
+        <div class="metric"><span class="metric-label">Debt/Equity</span><span class="metric-value {{ 'risk-high' if c.debt_to_equity is not none and c.debt_to_equity >= 200 else '' }}">{{ "%.0f%%"|format(c.debt_to_equity) if c.debt_to_equity is not none else "n/a" }}</span></div>
+        <div class="metric"><span class="metric-label">vs Market</span><span class="metric-value highlight">{{ "%+.1f%%"|format(c.relative_strength_pct) if c.relative_strength_pct is not none else "n/a" }} <span class="muted">vs SPY</span></span></div>
+      </div>
+
+      <div class="badges">
+        {% if c.ticker in recent_split_tickers %}
+          <span class="badge badge-info" title="Recent news mentions a stock split for this ticker - double-check the strike/premium economics still make sense">⚠ Recent stock-split news</span>
+        {% endif %}
+        {% set sector_trend = sector_trend_by_name.get(c.sector) if c.sector else none %}
+        {% if c.sector and sector_trend is not none %}
+          <span class="badge {{ 'badge-sector-up' if sector_trend >= 0 else 'badge-sector-down' }}">
+            Sector: {{ c.sector }}{% if c.industry %} · {{ c.industry }}{% endif %} ({{ "%+.2f"|format(sector_trend) }}% / {{ sector_lookback_days }}d)
+          </span>
+        {% elif c.sector %}
+          <span class="badge badge-neutral">Sector: {{ c.sector }}</span>
+        {% endif %}
+        {% if c.analyst_recommendation %}<span class="badge badge-neutral">Analyst: {{ c.analyst_recommendation|replace("_"," ")|title }}{% if c.analyst_target_mean_price %} (avg target ${{ "%.0f"|format(c.analyst_target_mean_price) }}){% endif %}</span>{% endif %}
+      </div>
+
+      {% set ev = events_by_ticker.get(c.ticker) %}
+      {% if ev %}
+      <details class="events-panel">
+        <summary>Events &amp; filings for {{ c.ticker }}</summary>
+
+        <div class="events-grid">
+          <div class="events-col">
+            <h4>Earnings</h4>
+            {% if ev.earnings and ev.earnings.earnings_date %}
+              <p>Next: {{ ev.earnings.earnings_date }}{% if ev.earnings.is_estimate %} (estimated){% endif %}</p>
+            {% else %}
+              <p class="muted">No upcoming earnings date found.</p>
+            {% endif %}
+            {% if ev.reaction and ev.reaction.earnings_date %}
+              <p>Last report ({{ ev.reaction.earnings_date }}): EPS surprise {{ "%.1f"|format(ev.reaction.surprise_pct) }}%,
+                 price reaction {{ "%.1f"|format(ev.reaction.reaction_pct) }}%
+                 {% if ev.reaction.anomaly_type and ev.reaction.anomaly_type != 'normal' %}
+                   - <strong>anomaly: {{ ev.reaction.anomaly_type|replace("_"," ") }}</strong>
+                 {% endif %}
+              </p>
+            {% endif %}
+
+            <h4>13F - prominent investors</h4>
+            {% if ev.thirteenf %}
+              <ul>
+                {% for h in ev.thirteenf %}
+                  <li>{{ h.investor_name }}: {{ h.action }}
+                    {% if h.pct_change is not none %}({{ "%.1f"|format(h.pct_change) }}%){% endif %}
+                    as of {{ h.period_of_report }}</li>
+                {% endfor %}
+              </ul>
+            {% else %}
+              <p class="muted">No recent position changes among tracked investors.</p>
+            {% endif %}
+          </div>
+
+          <div class="events-col">
+            <h4>SEC 8-K filings (material events)</h4>
+            {% if ev.filings_8k %}
+              <ul>
+                {% for f in ev.filings_8k %}
+                  <li><a href="{{ f.filing_url }}" target="_blank" rel="noopener">{{ f.filed_date }}</a> - items {{ f['items'] or "n/a" }}</li>
+                {% endfor %}
+              </ul>
+            {% else %}
+              <p class="muted">No recent 8-K filings.</p>
+            {% endif %}
+
+            <h4>News</h4>
+            {% if ev.news %}
+              <ul>
+                {% for n in ev.news %}
+                  <li>
+                    <span class="badge badge-cat badge-cat-{{ n.category }}">{{ n.category }}</span>
+                    <a href="{{ n.link }}" target="_blank" rel="noopener">{{ n.title }}</a>
+                    <span class="muted">({{ n.source }})</span>
+                  </li>
+                {% endfor %}
+              </ul>
+            {% else %}
+              <p class="muted">No recent news items.</p>
+            {% endif %}
+          </div>
+        </div>
+      </details>
+      {% endif %}
+
+      </div>
+    </div>
+    {% endfor %}
+  </div>
+  </details>
+  {% endif %}
+
+  <details class="track-record-panel">
+    <summary>
+      Track record
+      {% if weekly_call_buy_history_summary.total %}
+        - {{ weekly_call_buy_history_summary.win }}/{{ weekly_call_buy_history_summary.total }} won ({{ weekly_call_buy_history_summary.win_rate_pct }}%)
+      {% else %}
+        - no expired recommendations yet
+      {% endif %}
+    </summary>
+    {% if weekly_call_buy_history %}
+      <table class="history-table">
+        <thead>
+          <tr>
+            <th>Ticker</th><th>First seen</th><th>Expiry</th><th>Strike</th><th>Premium</th>
+            <th>Close @ expiry</th><th>Resolved</th><th>Return</th><th>Decision</th><th>Outcome</th><th></th>
+          </tr>
+        </thead>
+        <tbody>
+          {% for h in weekly_call_buy_history %}
+          <tr>
+            <td>{{ h.ticker }}</td>
+            <td>{{ h.first_seen_at or "n/a" }}{% if h.price_captured_at %} <span class="muted">{{ h.price_captured_at[11:16] }} UTC</span>{% endif %}</td>
+            <td>{{ h.expiry }}</td>
+            <td>${{ "%.2f"|format(h.strike) }}</td>
+            <td>${{ "%.0f"|format(h.premium_total) }}</td>
+            <td class="cell-resolved-price">${{ "%.2f"|format(h.expiry_close_price) if h.expiry_close_price is not none else "n/a" }}</td>
+            <td class="cell-resolved-date">{{ h.evaluated_at[:10] if h.evaluated_at else "n/a" }}</td>
+            <td class="cell-return {{ 'pulse-up' if h.return_pct is not none and h.return_pct >= 0 else 'pulse-down' if h.return_pct is not none else 'pulse-up' if h.live_return_pct is not none and h.live_return_pct >= 0 else 'pulse-down' if h.live_return_pct is not none else '' }}{{ ' return-live-preview' if h.return_pct is none and h.live_return_pct is not none else '' }}"
+                {%- if h.return_pct is none and h.live_return_pct is not none %} title="Live estimate as of now, not locked in - the official return is only set once this is actually resolved."{% endif %}>{% if h.return_pct is not none %}{{ "%+.1f%%"|format(h.return_pct) }}{% elif h.live_return_pct is not none %}~{{ "%+.1f%%"|format(h.live_return_pct) }} (now){% else %}n/a{% endif %}</td>
+            <td>{% if h.decision %}<span class="badge decision-{{ h.decision }}">{{ h.decision|title }}</span>{% else %}<span class="muted">-</span>{% endif %}</td>
+            <td class="cell-outcome">{% if h.outcome %}<span class="badge outcome-{{ h.outcome }}">{{ h.outcome|replace("_"," ")|title }}</span>{% else %}<span class="muted">Pending</span>{% endif %}</td>
+            <td>
+              <button class="history-delete-btn" title="Stop tracking and delete this row" onclick="deleteHistoryRow(this, 'weekly_call_buy')"
+                data-run-id="{{ h.run_id }}" data-ticker="{{ h.ticker }}" data-expiry="{{ h.expiry }}" data-strike="{{ h.strike }}">✕</button>
+              {% if not h.outcome %}
+              <button class="refresh-outcome-btn" title="Check if this is resolvable now" onclick="refreshHistoryOutcome(this, 'weekly_call_buy')"
+                data-run-id="{{ h.run_id }}" data-ticker="{{ h.ticker }}" data-expiry="{{ h.expiry }}" data-strike="{{ h.strike }}">⟳</button>
+              {% endif %}
+            </td>
+          </tr>
+          {% endfor %}
+        </tbody>
+      </table>
+    {% else %}
+      <p class="muted">Recommendations are scored once their expiry has passed - checked each time the server starts.</p>
+    {% endif %}
+  </details>
+</section>
+
+<section class="strategy-panel">
+  <div class="strategy-heading-row">
     <h2 class="strategy-heading">Dip Buy Watch <span class="active-count-badge">{{ dip_candidates|length }} active</span></h2>
     <div class="strategy-actions">
       <span id="refresh-status-dip_buy" class="muted">{% if refresh_states.dip_buy.running %}{{ refresh_states.dip_buy.step or "Generating..." }}{% endif %}</span>
@@ -576,6 +969,8 @@ const EMPTY_STATE_TEXT = {
   cash_secured_put: 'No active recommendations right now. Click "Generate" to scan for new ones.',
   dip_buy: 'No active dip-buy candidates right now. Click "Generate" to scan for new ones.',
   three_day_rule: 'No active 3-day-rule candidates right now. Click "Generate" to scan for new ones.',
+  covered_call: 'No active recommendations right now. Click "Generate" to scan for new ones.',
+  weekly_call_buy: 'No active recommendations right now. Click "Generate" to scan for new ones.',
 };
 
 function decideCandidate(btn, strategy, decision) {

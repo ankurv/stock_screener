@@ -64,3 +64,44 @@ def put_greeks(
 
     prob_otm = min(max(prob_otm, 0.0), 1.0)
     return PutGreeks(delta=delta, prob_otm=prob_otm, prob_itm=1.0 - prob_otm)
+
+
+@dataclass
+class CallGreeks:
+    delta: float          # positive, standard call delta convention
+    prob_otm: float        # risk-neutral probability stock stays <= strike at expiry (0-1) - call expires worthless
+    prob_itm: float         # 1 - prob_otm
+
+
+def call_greeks(
+    spot: float,
+    strike: float,
+    days_to_expiry: float,
+    implied_vol: float,
+    risk_free_rate: float = 0.045,
+) -> CallGreeks:
+    """
+    Sibling to put_greeks - identical d1/d2 computation (same Black-Scholes
+    inputs), only the final delta/prob_otm formulas differ by sign, same
+    "model estimate, not a guarantee" caveat as put_greeks' docstring.
+    """
+    if spot <= 0 or strike <= 0:
+        return CallGreeks(delta=0.0, prob_otm=0.5, prob_itm=0.5)
+
+    t_years = max(days_to_expiry, 0.0) / 365.0
+
+    if t_years <= 0 or implied_vol is None or implied_vol <= 0:
+        is_otm = spot <= strike  # a call is OTM (worthless) when spot stays at/below strike
+        return CallGreeks(delta=(0.0 if is_otm else 1.0), prob_otm=(1.0 if is_otm else 0.0),
+                           prob_itm=(0.0 if is_otm else 1.0))
+
+    sigma = implied_vol
+    sqrt_t = math.sqrt(t_years)
+    d1 = (math.log(spot / strike) + (risk_free_rate + 0.5 * sigma ** 2) * t_years) / (sigma * sqrt_t)
+    d2 = d1 - sigma * sqrt_t
+
+    prob_otm = norm_cdf(-d2)         # P(S_T <= K) under risk-neutral measure -> call expires worthless
+    delta = norm_cdf(d1)              # standard Black-Scholes call delta (>=0)
+
+    prob_otm = min(max(prob_otm, 0.0), 1.0)
+    return CallGreeks(delta=delta, prob_otm=prob_otm, prob_itm=1.0 - prob_otm)

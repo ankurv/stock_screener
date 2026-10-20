@@ -307,6 +307,42 @@ class Database:
             return None
         return dict(row)
 
+    _ANALYST_SNAPSHOT_HISTORY_COLUMNS = [
+        "recommendation_key", "recommendation_mean", "num_analysts",
+        "target_mean_price", "target_high_price", "target_low_price",
+    ]
+
+    def append_analyst_snapshot_history(self, ticker: str, snap: dict, snapshot_date: Optional[str] = None):
+        """
+        One row per ticker per calendar day - idempotent re-run on the same
+        day (ON CONFLICT updates in place) so calling this more than once in
+        a day (e.g. re-running the pipeline) doesn't create duplicate rows.
+        Called alongside upsert_analyst_snapshot, not instead of it - see
+        analyst_snapshot_history's schema comment.
+        """
+        cols = self._ANALYST_SNAPSHOT_HISTORY_COLUMNS
+        snapshot_date = snapshot_date or utcnow_iso()[:10]
+        with self.conn() as c:
+            c.execute(
+                f"INSERT INTO analyst_snapshot_history (ticker, snapshot_date, {', '.join(cols)}, updated_at) "
+                f"VALUES (:ticker, :snapshot_date, {', '.join(':' + col for col in cols)}, :updated_at) "
+                f"ON CONFLICT(ticker, snapshot_date) DO UPDATE SET {', '.join(f'{col}=excluded.{col}' for col in cols)}, "
+                f"updated_at=excluded.updated_at",
+                {
+                    "ticker": ticker, "snapshot_date": snapshot_date, "updated_at": utcnow_iso(),
+                    **{col: snap.get(col) for col in cols},
+                },
+            )
+
+    def get_analyst_snapshot_history(self, ticker: str, limit: int = 60) -> list[dict]:
+        """Ascending by date (oldest first) - the shape engine.signals.analyst_revision_momentum_score expects."""
+        with self.conn() as c:
+            rows = c.execute(
+                "SELECT * FROM analyst_snapshot_history WHERE ticker = ? ORDER BY snapshot_date DESC LIMIT ?",
+                (ticker, limit),
+            ).fetchall()
+        return [dict(r) for r in reversed(rows)]
+
     # ------------------------------------------------------------------
     # Post-earnings reaction anomaly
     # ------------------------------------------------------------------
@@ -358,6 +394,36 @@ class Database:
         with self.conn() as c:
             rows = c.execute(
                 "SELECT * FROM put_option_snapshot WHERE ticker = ? ORDER BY expiry, strike", (ticker,)
+            ).fetchall()
+        if not rows:
+            return []
+        if ttl_minutes is not None and _minutes_old(rows[0]["updated_at"]) > ttl_minutes:
+            return []
+        return [dict(r) for r in rows]
+
+    def replace_call_snapshots(self, ticker: str, rows: Iterable[dict]):
+        """See replace_put_snapshots - identical shape, call_option_snapshot table."""
+        now = utcnow_iso()
+        with self.conn() as c:
+            c.execute("DELETE FROM call_option_snapshot WHERE ticker = ?", (ticker,))
+            c.executemany(
+                "INSERT INTO call_option_snapshot "
+                "(ticker, expiry, strike, bid, ask, last_price, implied_vol, open_interest, volume, in_the_money, updated_at) "
+                "VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)",
+                [
+                    (
+                        ticker, r["expiry"], r["strike"], r.get("bid"), r.get("ask"),
+                        r.get("last_price"), r.get("implied_vol"), r.get("open_interest"),
+                        r.get("volume"), int(bool(r.get("in_the_money"))), now,
+                    )
+                    for r in rows
+                ],
+            )
+
+    def get_call_snapshots(self, ticker: str, ttl_minutes: Optional[float] = None) -> list[dict]:
+        with self.conn() as c:
+            rows = c.execute(
+                "SELECT * FROM call_option_snapshot WHERE ticker = ? ORDER BY expiry, strike", (ticker,)
             ).fetchall()
         if not rows:
             return []
@@ -660,6 +726,147 @@ class Database:
         with self.conn() as c:
             rows = c.execute(
                 "SELECT * FROM put_candidate WHERE outcome IS NOT NULL OR decision IS NOT NULL "
+                "ORDER BY expiry DESC, ticker LIMIT ?", (limit,)
+            ).fetchall()
+        return [dict(r) for r in rows]
+
+    # ------------------------------------------------------------------
+    # Covered calls (see engine/strategies/covered_call.py) - same natural
+    # key shape as put_candidate (run_id, ticker, expiry, strike), built on
+    # the generic _save_rows/_latest_rows_for_run/_active_rows helpers
+    # below instead of a hand-rolled save method - unlike put_candidate,
+    # there's only ever one contract-shaped table per ticker at a time
+    # pending, so the generic carry-forward logic applies directly.
+    # ------------------------------------------------------------------
+    _CALL_CANDIDATE_COLUMNS = [
+        "run_id", "ticker", "company_name", "price", "sector", "first_seen_at", "price_captured_at",
+        "expiry", "strike", "bid", "ask", "mid_price", "shares_value", "premium_total",
+        "annualized_yield_pct", "prob_otm_pct", "delta", "open_interest", "spread_pct",
+        "days_to_expiry", "earnings_before_expiry", "analyst_recommendation", "analyst_target_mean_price",
+        "pe_ratio", "week52_low", "week52_high", "debt_to_equity", "industry",
+        "relative_strength_pct", "historical_median_depth_pct", "historical_median_duration_days",
+        "earnings_anomaly_type", "composite_score", "risk_score", "risk_label",
+        "rsi_14", "trend", "macd_bullish", "rank",
+    ]
+
+    def save_call_candidates(self, run_id: int, candidates: Iterable[dict]):
+        self._save_rows("call_candidate", self._CALL_CANDIDATE_COLUMNS, run_id, candidates, date_col="first_seen_at")
+
+    def get_latest_call_candidates(self, active_only: bool = False, as_of: Optional[str] = None) -> list[dict]:
+        if not active_only:
+            return self._latest_rows_for_run("call_candidate")
+        as_of = as_of or utcnow_iso()[:10]
+        return self._active_rows("call_candidate", "expiry >= ?", (as_of,))
+
+    def get_unevaluated_call_candidates(self, as_of: Optional[str] = None) -> list[dict]:
+        as_of = as_of or utcnow_iso()[:10]
+        with self.conn() as c:
+            rows = c.execute(
+                "SELECT * FROM call_candidate WHERE outcome IS NULL AND expiry <= ? ORDER BY expiry", (as_of,)
+            ).fetchall()
+        return [dict(r) for r in rows]
+
+    def get_call_candidate_row(self, run_id: int, ticker: str, expiry: str, strike: float) -> Optional[dict]:
+        return self._get_row("call_candidate", run_id, ticker, "expiry=? AND strike=?", (expiry, strike))
+
+    def record_call_outcome(
+        self, run_id: int, ticker: str, expiry: str, strike: float, outcome: str,
+        expiry_close_price: Optional[float], return_pct: Optional[float] = None,
+    ):
+        with self.conn() as c:
+            c.execute(
+                "UPDATE call_candidate SET outcome=?, expiry_close_price=?, evaluated_at=?, return_pct=? "
+                "WHERE run_id=? AND ticker=? AND expiry=? AND strike=?",
+                (outcome, expiry_close_price, utcnow_iso(), return_pct, run_id, ticker, expiry, strike),
+            )
+
+    def record_call_decision(self, run_id: int, ticker: str, expiry: str, strike: float, decision: str):
+        with self.conn() as c:
+            c.execute(
+                "UPDATE call_candidate SET decision=?, decided_at=? WHERE run_id=? AND ticker=? AND expiry=? AND strike=?",
+                (decision, utcnow_iso(), run_id, ticker, expiry, strike),
+            )
+
+    def delete_call_candidate_row(self, run_id: int, ticker: str, expiry: str, strike: float):
+        with self.conn() as c:
+            c.execute(
+                "DELETE FROM call_candidate WHERE run_id=? AND ticker=? AND expiry=? AND strike=?",
+                (run_id, ticker, expiry, strike),
+            )
+
+    def get_call_history(self, limit: int = 200) -> list[dict]:
+        with self.conn() as c:
+            rows = c.execute(
+                "SELECT * FROM call_candidate WHERE outcome IS NOT NULL OR decision IS NOT NULL "
+                "ORDER BY expiry DESC, ticker LIMIT ?", (limit,)
+            ).fetchall()
+        return [dict(r) for r in rows]
+
+    # ------------------------------------------------------------------
+    # Weekly call buys (see engine/strategies/weekly_call_buy.py) - same
+    # natural key/generic-helper pattern as call_candidate above.
+    # ------------------------------------------------------------------
+    _WEEKLY_CALL_BUY_COLUMNS = [
+        "run_id", "ticker", "company_name", "price", "sector", "first_seen_at", "price_captured_at",
+        "expiry", "strike", "bid", "ask", "mid_price", "premium_total", "breakeven_price",
+        "required_move_pct", "prob_profit_pct", "delta", "implied_vol", "open_interest", "spread_pct",
+        "days_to_expiry", "analyst_recommendation", "analyst_target_mean_price",
+        "pe_ratio", "week52_low", "week52_high", "debt_to_equity", "industry",
+        "relative_strength_pct", "rsi_14", "trend", "macd_bullish",
+        "composite_score", "risk_score", "risk_label", "rank",
+    ]
+
+    def save_weekly_call_buy_candidates(self, run_id: int, candidates: Iterable[dict]):
+        self._save_rows(
+            "weekly_call_buy_candidate", self._WEEKLY_CALL_BUY_COLUMNS, run_id, candidates, date_col="first_seen_at"
+        )
+
+    def get_latest_weekly_call_buy_candidates(self, active_only: bool = False, as_of: Optional[str] = None) -> list[dict]:
+        if not active_only:
+            return self._latest_rows_for_run("weekly_call_buy_candidate")
+        as_of = as_of or utcnow_iso()[:10]
+        return self._active_rows("weekly_call_buy_candidate", "expiry >= ?", (as_of,))
+
+    def get_unevaluated_weekly_call_buy_candidates(self, as_of: Optional[str] = None) -> list[dict]:
+        as_of = as_of or utcnow_iso()[:10]
+        with self.conn() as c:
+            rows = c.execute(
+                "SELECT * FROM weekly_call_buy_candidate WHERE outcome IS NULL AND expiry <= ? ORDER BY expiry", (as_of,)
+            ).fetchall()
+        return [dict(r) for r in rows]
+
+    def get_weekly_call_buy_candidate_row(self, run_id: int, ticker: str, expiry: str, strike: float) -> Optional[dict]:
+        return self._get_row("weekly_call_buy_candidate", run_id, ticker, "expiry=? AND strike=?", (expiry, strike))
+
+    def record_weekly_call_buy_outcome(
+        self, run_id: int, ticker: str, expiry: str, strike: float, outcome: str,
+        expiry_close_price: Optional[float], return_pct: Optional[float] = None,
+    ):
+        with self.conn() as c:
+            c.execute(
+                "UPDATE weekly_call_buy_candidate SET outcome=?, expiry_close_price=?, evaluated_at=?, return_pct=? "
+                "WHERE run_id=? AND ticker=? AND expiry=? AND strike=?",
+                (outcome, expiry_close_price, utcnow_iso(), return_pct, run_id, ticker, expiry, strike),
+            )
+
+    def record_weekly_call_buy_decision(self, run_id: int, ticker: str, expiry: str, strike: float, decision: str):
+        with self.conn() as c:
+            c.execute(
+                "UPDATE weekly_call_buy_candidate SET decision=?, decided_at=? WHERE run_id=? AND ticker=? AND expiry=? AND strike=?",
+                (decision, utcnow_iso(), run_id, ticker, expiry, strike),
+            )
+
+    def delete_weekly_call_buy_candidate_row(self, run_id: int, ticker: str, expiry: str, strike: float):
+        with self.conn() as c:
+            c.execute(
+                "DELETE FROM weekly_call_buy_candidate WHERE run_id=? AND ticker=? AND expiry=? AND strike=?",
+                (run_id, ticker, expiry, strike),
+            )
+
+    def get_weekly_call_buy_history(self, limit: int = 200) -> list[dict]:
+        with self.conn() as c:
+            rows = c.execute(
+                "SELECT * FROM weekly_call_buy_candidate WHERE outcome IS NOT NULL OR decision IS NOT NULL "
                 "ORDER BY expiry DESC, ticker LIMIT ?", (limit,)
             ).fetchall()
         return [dict(r) for r in rows]

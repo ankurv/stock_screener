@@ -16,7 +16,7 @@ from typing import Callable, Optional
 
 import pandas as pd
 
-from common import get_logger, effective_ttl_minutes
+from common import get_logger, effective_ttl_minutes, effective_price_ttl_minutes, is_market_hours
 
 log = get_logger("market_data")
 
@@ -56,9 +56,34 @@ def pick_nearest_weekly_expiry(available_expiries: list[str], today: Optional[da
 
 
 def fetch_price(ticker: str) -> Optional[float]:
+    """
+    fast_info.lastPrice (the cheap path below) is pinned to the last
+    *regular-session* print - it does not move during pre/post-market
+    trading, even though the stock is actually trading and yfinance does
+    know the real extended-hours price (it's just in the much heavier
+    `.info` quote-summary payload instead, under preMarketPrice/
+    postMarketPrice). So outside regular hours, check `.info` first for a
+    genuinely live extended-hours quote; during regular hours, skip that
+    extra cost entirely and use the same cheap fast_info path as before -
+    this only pays for the heavier call when it's actually needed to be
+    correct, not on every single fetch.
+    """
     if yf is None:
         raise RuntimeError("yfinance is not installed - run: pip install -r requirements.txt")
     t = yf.Ticker(ticker)
+    if not is_market_hours():
+        try:
+            info = t.info or {}
+            state = info.get("marketState")
+            if state == "PRE" and info.get("preMarketPrice"):
+                return float(info["preMarketPrice"])
+            if state == "POST" and info.get("postMarketPrice"):
+                return float(info["postMarketPrice"])
+            price = info.get("regularMarketPrice") or info.get("currentPrice")
+            if price:
+                return float(price)
+        except Exception as exc:  # noqa: BLE001
+            log.debug("%s: extended-hours .info fetch failed (%s), falling back", ticker, exc)
     try:
         price = t.fast_info.get("lastPrice") if hasattr(t.fast_info, "get") else t.fast_info["lastPrice"]
         if price:
@@ -96,15 +121,36 @@ def fetch_quote(db, ticker: str, ttl_minutes: Optional[float] = None) -> Optiona
     move. Uses our own price_history cache instead (see
     refresh_price_history) - the same daily-close series everything else
     in this app already trusts.
+
+    Same pre/post-market gap as fetch_price: fast_info.lastPrice is pinned
+    to the last regular-session print, so outside regular hours this reads
+    the real extended-hours quote from `.info` instead - same conditional
+    (only pay the heavier call when the cheap path is known to be wrong) so
+    the 30s poll stays cheap during the regular session, when it's called
+    most often.
     """
     if yf is None:
         raise RuntimeError("yfinance is not installed - run: pip install -r requirements.txt")
     t = yf.Ticker(ticker)
-    try:
-        price = _fast_info_get(t.fast_info, "lastPrice")
-    except Exception as exc:  # noqa: BLE001
-        log.debug("%s: live quote fetch failed (%s)", ticker, exc)
-        return None
+    price = None
+    if not is_market_hours():
+        try:
+            info = t.info or {}
+            state = info.get("marketState")
+            if state == "PRE" and info.get("preMarketPrice"):
+                price = info["preMarketPrice"]
+            elif state == "POST" and info.get("postMarketPrice"):
+                price = info["postMarketPrice"]
+            else:
+                price = info.get("regularMarketPrice") or info.get("currentPrice")
+        except Exception as exc:  # noqa: BLE001
+            log.debug("%s: extended-hours .info quote failed (%s), falling back", ticker, exc)
+    if not price:
+        try:
+            price = _fast_info_get(t.fast_info, "lastPrice")
+        except Exception as exc:  # noqa: BLE001
+            log.debug("%s: live quote fetch failed (%s)", ticker, exc)
+            return None
     if not price:
         return None
 
@@ -898,21 +944,9 @@ def fetch_post_earnings_correction(db, ticker: str, earnings_date: date, ttl_min
     }
 
 
-def fetch_weekly_put_chain(ticker: str) -> tuple[Optional[str], list[dict]]:
-    """Returns (expiry_iso_or_None, list of put-contract dicts) for this week's expiry."""
-    if yf is None:
-        raise RuntimeError("yfinance is not installed - run: pip install -r requirements.txt")
-    t = yf.Ticker(ticker)
-    expiries = t.options
-    if not expiries:
-        return None, []
-    expiry = pick_nearest_weekly_expiry(list(expiries))
-    if not expiry:
-        return None, []
-    chain = t.option_chain(expiry)
-    puts = chain.puts
+def _option_chain_rows(df, expiry: str) -> list[dict]:
     rows = []
-    for _, r in puts.iterrows():
+    for _, r in df.iterrows():
         rows.append(
             {
                 "expiry": expiry,
@@ -926,7 +960,33 @@ def fetch_weekly_put_chain(ticker: str) -> tuple[Optional[str], list[dict]]:
                 "in_the_money": bool(r.get("inTheMoney", False)),
             }
         )
-    return expiry, rows
+    return rows
+
+
+def fetch_weekly_option_chain(ticker: str) -> tuple[Optional[str], list[dict], list[dict]]:
+    """
+    Returns (expiry_iso_or_None, put_rows, call_rows) for this week's
+    expiry - one `option_chain()` call already returns both sides, so
+    covered_call reuses this instead of paying for a second network
+    round-trip to the same endpoint cash_secured_put already hits.
+    """
+    if yf is None:
+        raise RuntimeError("yfinance is not installed - run: pip install -r requirements.txt")
+    t = yf.Ticker(ticker)
+    expiries = t.options
+    if not expiries:
+        return None, [], []
+    expiry = pick_nearest_weekly_expiry(list(expiries))
+    if not expiry:
+        return None, [], []
+    chain = t.option_chain(expiry)
+    return expiry, _option_chain_rows(chain.puts, expiry), _option_chain_rows(chain.calls, expiry)
+
+
+def fetch_weekly_put_chain(ticker: str) -> tuple[Optional[str], list[dict]]:
+    """Backward-compat wrapper over fetch_weekly_option_chain - puts only."""
+    expiry, puts, _calls = fetch_weekly_option_chain(ticker)
+    return expiry, puts
 
 
 def _refresh_one_ticker(
@@ -943,7 +1003,7 @@ def _refresh_one_ticker(
     work here regardless of how many threads are in flight.
     """
     result = {
-        "priced": 0, "earnings_updated": 0, "chains_updated": 0,
+        "priced": 0, "earnings_updated": 0, "chains_updated": 0, "calls_updated": 0,
         "analyst_updated": 0, "reaction_updated": 0, "technicals_updated": 0, "error": None,
     }
     try:
@@ -962,6 +1022,7 @@ def _refresh_one_ticker(
             snap = fetch_analyst_snapshot(ticker)
             if snap:
                 db.upsert_analyst_snapshot(ticker, snap)
+                db.append_analyst_snapshot_history(ticker, snap)
                 result["analyst_updated"] = 1
 
         if not is_etf and db.get_post_earnings_reaction(ticker, ttl_minutes=ttl["earnings_date"]) is None:
@@ -977,12 +1038,20 @@ def _refresh_one_ticker(
                 result["technicals_updated"] = 1
 
         if needs_chains:
-            cached_chain = db.get_put_snapshots(ticker, ttl_minutes=chain_ttl)
-            if not cached_chain:
-                expiry, rows = fetch_weekly_put_chain(ticker)
-                if expiry and rows:
-                    db.replace_put_snapshots(ticker, rows)
+            cached_puts = db.get_put_snapshots(ticker, ttl_minutes=chain_ttl)
+            cached_calls = db.get_call_snapshots(ticker, ttl_minutes=chain_ttl)
+            if not cached_puts or not cached_calls:
+                # One option_chain() fetch covers both sides - see
+                # fetch_weekly_option_chain - so a strategy needing only
+                # puts (or only calls) doesn't cost a second ticker any
+                # extra network round-trip once either side is stale.
+                expiry, put_rows, call_rows = fetch_weekly_option_chain(ticker)
+                if expiry and put_rows:
+                    db.replace_put_snapshots(ticker, put_rows)
                     result["chains_updated"] = 1
+                if expiry and call_rows:
+                    db.replace_call_snapshots(ticker, call_rows)
+                    result["calls_updated"] = 1
     except Exception as exc:  # noqa: BLE001
         result["error"] = f"{ticker}: {exc}"
     return result
@@ -1016,16 +1085,19 @@ def refresh_market_data(
     """
     ttl = cfg["cache_ttl_minutes"]
     anomaly_threshold = cfg.get("post_earnings_anomaly_threshold_pct", 3.0)
-    # Price/options chain can't move while the market's shut, so stretch
-    # those two TTLs to cover the gap until next open on evenings/weekends -
-    # computed once per call, not per ticker, since "now" barely moves
-    # across a single refresh pass.
-    price_ttl = effective_ttl_minutes(ttl["price"])
+    # Options chains can't move while the market's shut, so stretch that TTL
+    # to cover the gap until next open on evenings/weekends. Price is
+    # different - it keeps moving across pre/post-market too (see
+    # fetch_price's extended-hours handling), so its TTL only stretches
+    # during the genuinely-closed overnight/weekend gap, not the whole
+    # "market hours" window. Both computed once per call, not per ticker,
+    # since "now" barely moves across a single refresh pass.
+    price_ttl = effective_price_ttl_minutes(ttl["price"])
     chain_ttl = effective_ttl_minutes(ttl["options_chain"])
     history_ttl = effective_ttl_minutes(ttl.get("price_history", 240))
     max_workers = max_workers or cfg.get("universe_filter", {}).get("max_workers", 8)
     summary = {
-        "priced": 0, "earnings_updated": 0, "chains_updated": 0, "chains_skipped": not needs_chains,
+        "priced": 0, "earnings_updated": 0, "chains_updated": 0, "calls_updated": 0, "chains_skipped": not needs_chains,
         "analyst_updated": 0, "reaction_updated": 0, "technicals_updated": 0, "errors": [],
     }
 
@@ -1058,6 +1130,7 @@ def refresh_market_data(
             summary["reaction_updated"] += r["reaction_updated"]
             summary["technicals_updated"] += r["technicals_updated"]
             summary["chains_updated"] += r["chains_updated"]
+            summary["calls_updated"] += r["calls_updated"]
             if on_progress and (completed % progress_every == 0 or completed == total):
                 on_progress(f"Refreshing prices{' & option chains' if needs_chains else ''}... ({completed}/{total} tickers)")
 

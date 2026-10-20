@@ -343,6 +343,10 @@ h1 { font-size: 1.5rem; margin: 0; }
 .refresh-outcome-btn.spinning { animation: refresh-spin 0.7s linear infinite; }
 .history-delete-btn:disabled { opacity: 0.5; cursor: default; }
 .badge.outcome-won { color: var(--accent); border-color: var(--accent); }
+.badge.outcome-assigned { color: var(--info); border-color: var(--info); }
+.badge.outcome-win { color: var(--accent); border-color: var(--accent); }
+.badge.outcome-partial_loss { color: var(--warn); border-color: var(--warn); }
+.badge.outcome-max_loss { color: var(--danger); border-color: var(--danger); }
 .badge.outcome-assigned_profitable { color: var(--info); border-color: var(--info); }
 .badge.outcome-assigned_loss { color: var(--danger); border-color: var(--danger); }
 .badge.outcome-rebounded { color: var(--accent); border-color: var(--accent); }

@@ -11,10 +11,12 @@ code needs to change.
 
 from __future__ import annotations
 
-from engine.strategies import cash_secured_put, dip_buy, three_day_rule
+from engine.strategies import cash_secured_put, dip_buy, three_day_rule, covered_call, weekly_call_buy
 
 STRATEGIES = {
     cash_secured_put.KEY: cash_secured_put,
     dip_buy.KEY: dip_buy,
     three_day_rule.KEY: three_day_rule,
+    covered_call.KEY: covered_call,
+    weekly_call_buy.KEY: weekly_call_buy,
 }

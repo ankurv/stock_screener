@@ -23,6 +23,8 @@ _cfg_cache: Optional[dict] = None
 MARKET_TZ = ZoneInfo("America/New_York")
 _MARKET_OPEN = (9, 30)
 _MARKET_CLOSE = (16, 0)
+_EXTENDED_OPEN = (4, 0)
+_EXTENDED_CLOSE = (20, 0)
 
 
 def load_config(force_reload: bool = False) -> dict:
@@ -95,6 +97,24 @@ def is_market_hours(now: Optional[datetime] = None) -> bool:
     return (open_t[0], open_t[1]) <= (now.hour, now.minute) < (close_t[0], close_t[1])
 
 
+def is_extended_hours(now: Optional[datetime] = None) -> bool:
+    """
+    Weekday 4:00-20:00 America/New_York - covers the typical pre-market
+    (4:00-9:30) and post-market (16:00-20:00) sessions in addition to
+    regular hours. A stock's price can genuinely keep moving across this
+    whole window (see data_sources.market_data.fetch_price's extended-hours
+    handling), unlike the fully-closed overnight/weekend gap - used to stop
+    effective_price_ttl_minutes from treating "market's shut" as true
+    whenever it isn't, which would otherwise freeze a cached price_snapshot
+    on a stale regular-session close through an entire pre/post-market
+    session that actually moved the real price.
+    """
+    now = (now or datetime.now(MARKET_TZ)).astimezone(MARKET_TZ)
+    if now.weekday() >= 5:
+        return False
+    return (_EXTENDED_OPEN[0], _EXTENDED_OPEN[1]) <= (now.hour, now.minute) < (_EXTENDED_CLOSE[0], _EXTENDED_CLOSE[1])
+
+
 def minutes_until_next_market_open(now: Optional[datetime] = None) -> float:
     now = (now or datetime.now(MARKET_TZ)).astimezone(MARKET_TZ)
     candidate_day = now
@@ -120,6 +140,21 @@ def effective_ttl_minutes(base_ttl_minutes: float, now: Optional[datetime] = Non
     you want when planning for the next session.
     """
     if is_market_hours(now):
+        return base_ttl_minutes
+    return max(base_ttl_minutes, minutes_until_next_market_open(now) + 15)
+
+
+def effective_price_ttl_minutes(base_ttl_minutes: float, now: Optional[datetime] = None) -> float:
+    """
+    Same idea as effective_ttl_minutes, but for the live-price TTL
+    specifically: does NOT stretch during pre/post-market, since the price
+    really can keep moving then (data_sources.market_data.fetch_price reads
+    the real extended-hours quote in that window) - only stretches during
+    the genuinely-closed overnight/weekend gap when nothing is trading at
+    all. Options chains, by contrast, correctly keep using the plain
+    effective_ttl_minutes - those don't update outside regular hours.
+    """
+    if is_market_hours(now) or is_extended_hours(now):
         return base_ttl_minutes
     return max(base_ttl_minutes, minutes_until_next_market_open(now) + 15)
 

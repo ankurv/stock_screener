@@ -22,7 +22,7 @@ from __future__ import annotations
 from datetime import date, datetime
 from typing import Optional
 
-from engine.greeks import put_greeks
+from engine.greeks import put_greeks, call_greeks
 from engine.signals import (
     market_mood_risk_component,
     technical_risk_component,
@@ -46,18 +46,29 @@ def _parse_date(d: Optional[str]) -> Optional[date]:
         return None
 
 
-def strike_distance_risk_component(price: float, strike: float, comfortable_otm_pct: float = 15.0) -> float:
+def strike_distance_risk_component(
+    price: float, strike: float, comfortable_otm_pct: float = 15.0, option_kind: str = "put",
+) -> float:
     """
     0-1 extra-risk contribution from how close the strike is to the current
     price - independent of volatility: a strike sitting right at the money
     is a coin flip on assignment regardless of how calm the stock has been,
-    while a strike sold comfortably below the market has to fall further
-    before you're on the hook. 0% OTM (at or in the money) -> max risk;
-    >= comfortable_otm_pct% OTM -> no extra risk from this factor.
+    while a strike sold comfortably away from the market has to move
+    further before you're on the hook. 0% OTM (at or in the money) -> max
+    risk; >= comfortable_otm_pct% OTM -> no extra risk from this factor.
+
+    option_kind flips which direction counts as OTM: a put is OTM below
+    the current price (strike < price), a call is OTM above it
+    (strike > price) - see engine.strategies.covered_call, which passes
+    "call" here; cash_secured_put's put-side call sites are unaffected by
+    the default.
     """
     if not price or price <= 0:
         return 0.0
-    pct_otm = (price - strike) / price * 100.0  # negative => strike is above price (in the money)
+    pct_otm = (
+        (price - strike) / price * 100.0 if option_kind == "put"  # negative => strike above price (ITM for a put)
+        else (strike - price) / price * 100.0  # negative => strike below price (ITM for a call)
+    )
     return max(0.0, min(1.0, 1.0 - pct_otm / comfortable_otm_pct))
 
 
@@ -288,6 +299,191 @@ def evaluate_candidates(
                 "ask": ask,
                 "mid_price": round(mid, 4),
                 "collateral": collateral,
+                "premium_total": round(premium_total, 2),
+                "annualized_yield_pct": round(annualized_yield_pct, 2),
+                "prob_otm_pct": round(greeks.prob_otm * 100.0, 2),
+                "delta": round(greeks.delta, 4),
+                "open_interest": open_interest,
+                "spread_pct": round(spread_pct, 2) if spread_pct is not None else None,
+                "days_to_expiry": days_to_expiry,
+                "earnings_before_expiry": int(earnings_before_expiry),
+                "analyst_recommendation": (analyst_snapshot or {}).get("recommendation_key"),
+                "analyst_target_mean_price": (analyst_snapshot or {}).get("target_mean_price"),
+                "pe_ratio": (analyst_snapshot or {}).get("pe_ratio"),
+                "week52_low": (analyst_snapshot or {}).get("week52_low"),
+                "week52_high": (analyst_snapshot or {}).get("week52_high"),
+                "debt_to_equity": (analyst_snapshot or {}).get("debt_to_equity"),
+                "industry": (analyst_snapshot or {}).get("industry"),
+                "relative_strength_pct": round(relative_strength_pct, 2) if relative_strength_pct is not None else None,
+                "historical_median_depth_pct": (historical_drawdown_stats or {}).get("median_depth_pct"),
+                "historical_median_duration_days": (historical_drawdown_stats or {}).get("median_duration_days"),
+                "earnings_anomaly_type": anomaly_type,
+                "composite_score": round(composite, 4),
+                "risk_score": risk_score,
+                "risk_label": risk_label,
+                "rsi_14": (technicals or {}).get("rsi_14"),
+                "trend": (technicals or {}).get("trend"),
+                "macd_bullish": _nullable_int((technicals or {}).get("macd_bullish")),
+                "rank": None,
+            }
+        )
+
+    return results
+
+
+def evaluate_call_candidates(
+    ticker: str,
+    company_name: Optional[str],
+    price: float,
+    call_rows: list[dict],
+    earnings_date: Optional[str],
+    cfg: dict,
+    today: Optional[date] = None,
+    analyst_snapshot: Optional[dict] = None,
+    earnings_reaction: Optional[dict] = None,
+    market_mood: Optional[dict] = None,
+    technicals: Optional[dict] = None,
+    sector: Optional[str] = None,
+    relative_strength_pct: Optional[float] = None,
+    historical_drawdown_stats: Optional[dict] = None,
+) -> list[dict]:
+    """
+    Covered-call sibling of evaluate_candidates - same hard-filter/scoring
+    shape, mirrored for the opposite direction: OTM means strike ABOVE the
+    current price (see strike_distance_risk_component's option_kind="call"),
+    there's no cash collateral (shares_value = price * 100 - the 100 shares
+    you already hold/are covering the call with - is the capital base the
+    yield and risk score are measured against instead of strike * 100),
+    and the risk-score/signal machinery (market mood, technicals, leverage,
+    relative weakness, historical drawdown) is identical to evaluate_candidates'
+    - a covered call should also be sold on names you're fine holding, so the
+    same "how risky is this stock to own" read applies unchanged.
+    """
+    today = today or date.today()
+    if not price or price <= 0 or not call_rows:
+        return []
+
+    w = cfg["weights"]
+    results = []
+
+    analyst_score = analyst_sentiment_score(analyst_snapshot, price)
+    anomaly_type = (earnings_reaction or {}).get("anomaly_type")
+    mood_component = market_mood_risk_component((market_mood or {}).get("trend_pct"))
+    tech_component = technical_risk_component(technicals)
+    leverage_component = leverage_risk_component(
+        (analyst_snapshot or {}).get("debt_to_equity"), (market_mood or {}).get("rate_trend_pct")
+    )
+    relative_weakness_component = relative_weakness_risk_component(relative_strength_pct)
+    historical_drawdown_component = historical_drawdown_risk_component(
+        (historical_drawdown_stats or {}).get("median_depth_pct"),
+        (historical_drawdown_stats or {}).get("median_duration_days"),
+    )
+    is_beat_but_sold_off = anomaly_type == "beat_but_sold_off"
+
+    for row in call_rows:
+        strike = row.get("strike")
+        if not strike or strike <= 0:
+            continue
+        if row.get("in_the_money"):
+            # Same reasoning as evaluate_candidates' identical guard: selling an
+            # ITM call means near-certain, immediate assignment for little extra
+            # premium - the point here is to collect time value, not give the
+            # shares away right away.
+            continue
+        shares_value = price * 100.0  # the 100 shares "covering" this call - CSP's collateral equivalent
+
+        bid = row.get("bid") or 0.0
+        ask = row.get("ask") or 0.0
+        if bid <= 0:
+            continue
+        if bid < cfg.get("min_bid_price", 0.50):
+            continue
+        mid = (bid + ask) / 2.0 if ask > 0 else bid
+
+        expiry_date = _parse_date(row.get("expiry"))
+        if expiry_date is None:
+            continue
+        days_to_expiry = max((expiry_date - today).days, 0)
+        annualize_days = max(days_to_expiry, 1)
+
+        premium_total = bid * 100.0
+        annualized_yield_pct = (bid / price) * (365.0 / annualize_days) * 100.0
+        if annualized_yield_pct < cfg["min_annualized_yield_pct"]:
+            continue
+
+        open_interest = row.get("open_interest") or 0
+        if open_interest < cfg["min_open_interest"]:
+            continue
+
+        spread_pct = ((ask - bid) / mid * 100.0) if (ask > 0 and mid > 0) else None
+        if spread_pct is not None and spread_pct > cfg["max_bid_ask_spread_pct"]:
+            continue
+
+        greeks = call_greeks(
+            spot=price, strike=strike, days_to_expiry=days_to_expiry,
+            implied_vol=row.get("implied_vol"), risk_free_rate=cfg.get("risk_free_rate", 0.045),
+        )
+
+        earnings_dt = _parse_date(earnings_date)
+        earnings_before_expiry = bool(earnings_dt and today <= earnings_dt <= expiry_date)
+        if earnings_before_expiry and cfg.get("exclude_if_earnings_before_expiry"):
+            continue
+
+        # Strike must be OTM (above price for a call) and within a bounded
+        # distance - same banding logic as evaluate_candidates, direction flipped.
+        pct_otm = (strike - price) / price * 100.0
+        max_otm_pct = (
+            cfg.get("strike_otm_pct_max_with_earnings", 15.0)
+            if earnings_before_expiry
+            else cfg.get("strike_otm_pct_max", 5.0)
+        )
+        if pct_otm < 0 or pct_otm > max_otm_pct:
+            continue
+
+        yield_score = min(annualized_yield_pct / 50.0, 1.0)
+        prob_score = greeks.prob_otm
+        oi_component = min(open_interest / 500.0, 1.0)
+        spread_component = 1.0 if spread_pct is None else max(0.0, 1.0 - spread_pct / cfg["max_bid_ask_spread_pct"])
+        liquidity_score = 0.5 * oi_component + 0.5 * spread_component
+        earnings_flag_score = 1.0 if earnings_before_expiry else 0.0
+        anomaly_flag_score = 1.0 if is_beat_but_sold_off else 0.0
+
+        composite = (
+            w["annualized_yield"] * yield_score
+            + w["probability_otm"] * prob_score
+            + w["liquidity"] * liquidity_score
+            + w.get("analyst_sentiment", 0.0) * analyst_score
+            - w["earnings_penalty"] * earnings_flag_score
+            - w.get("anomaly_penalty", 0.0) * anomaly_flag_score
+        )
+
+        risk_score, risk_label = _risk_score(
+            implied_vol=row.get("implied_vol"),
+            has_analyst_coverage=bool(analyst_snapshot),
+            earnings_before_expiry=earnings_before_expiry,
+            spread_pct=spread_pct,
+            max_spread_pct=cfg["max_bid_ask_spread_pct"],
+            market_mood_component=mood_component,
+            technical_component=tech_component,
+            strike_distance_component=strike_distance_risk_component(price, strike, option_kind="call"),
+            leverage_component=leverage_component,
+            relative_weakness_component=relative_weakness_component,
+            historical_drawdown_component=historical_drawdown_component,
+        )
+
+        results.append(
+            {
+                "ticker": ticker,
+                "company_name": company_name,
+                "price": round(price, 2),
+                "sector": sector,
+                "first_seen_at": today.isoformat(),
+                "expiry": row["expiry"],
+                "strike": strike,
+                "bid": bid,
+                "ask": ask,
+                "mid_price": round(mid, 4),
+                "shares_value": shares_value,
                 "premium_total": round(premium_total, 2),
                 "annualized_yield_pct": round(annualized_yield_pct, 2),
                 "prob_otm_pct": round(greeks.prob_otm * 100.0, 2),
